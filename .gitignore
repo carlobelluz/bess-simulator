@@ -15,5 +15,8 @@ results/
 # Claude Code
 .claude/
 
+# Credenziali locali — mai su GitHub
+.env
+
 # Jupyter
 .ipynb_checkpoints/
