@@ -1,0 +1,527 @@
+"""
+app.py
+BESS Decision Tool — entry point web app.
+
+Usage:
+  streamlit run app.py
+
+Two-step flow:
+  Step 1: form — user describes site, consumption, PV, goals
+  Step 2: results — recommended solution + business case + technical view
+
+The existing engine (profile_builder, bess_engine, economics) is called
+directly — no JSON files or CLI scripts needed.
+"""
+
+import json
+import os
+import time
+
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import requests
+import streamlit as st
+
+from engine import build_all_profiles, simulate, compute_economics
+
+SLOT_H   = 0.25
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+_SEASON_DAYS = {
+    "Inverno (gennaio)":   21,
+    "Primavera (aprile)": 105,
+    "Estate (luglio)":    189,
+    "Autunno (ottobre)":  280,
+}
+_DOW_LABELS = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _geocode(location: str) -> tuple[float, float] | None:
+    try:
+        resp = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": location, "format": "json", "limit": 1},
+            headers={"User-Agent": "bess-simulator/0.1 (carlo.belluz@gmail.com)"},
+            timeout=6,
+        )
+        results = resp.json()
+        if results:
+            return float(results[0]["lat"]), float(results[0]["lon"])
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_bess(bess: dict) -> dict:
+    product_id = bess.get("product_id")
+    if not product_id:
+        return bess
+    product_path = os.path.join(BASE_DIR, "products", f"{product_id}.json")
+    if not os.path.exists(product_path):
+        return bess
+    with open(product_path) as f:
+        product = json.load(f)
+    defaults = product["simulation_defaults"]
+    if "potenza_nominale_kw" in defaults:
+        defaults.setdefault("potenza_carica_kw",  defaults["potenza_nominale_kw"])
+        defaults.setdefault("potenza_scarica_kw", defaults["potenza_nominale_kw"])
+    clean = {k: v for k, v in defaults.items()
+             if not k.startswith("_") and not k.endswith("_fonte") and "override" not in k}
+    return {**clean, **bess}
+
+
+def _build_case(form: dict) -> dict:
+    ha_pv      = form["ha_pv"] and form["kwp"] > 0
+    lat        = form.get("lat") or 45.5
+    lon        = form.get("lon") or 10.0
+    pv_source  = "pvgis" if (ha_pv and form.get("lat") is not None) else "sintetico"
+    cliente_id = form["nome_cliente"].lower().replace(" ", "-")[:20] or "cliente"
+
+    case = {
+        "meta": {
+            "case_id":       f"app-{cliente_id}",
+            "nome_cliente":  form["nome_cliente"] or "Cliente",
+            "nome_sito":     form["location"] or "Sito",
+            "data_creazione": "2026-05-05",
+            "autore":        "app",
+        },
+        "site": {
+            "consumo_annuo_kwh":        form["consumo_annuo_kwh"],
+            "picco_potenza_kw":         form["picco_potenza_kw"],
+            "lat":                      lat,
+            "lon":                      lon,
+            "ore_lavoro_giorno":        form["ore_lavoro_giorno"],
+            "giorni_lavoro_settimana":  form["giorni_lavoro_settimana"],
+        },
+        "pv": {
+            "presente":              ha_pv,
+            "kwp":                   form["kwp"] if ha_pv else 0,
+            "profilo_source":        pv_source,
+            "fv_export_regime":      "nessuno",
+            "fv_export_value_eur_kwh": None,
+        },
+        "tariffs": {
+            "market_price_series":    "prices/it_nord_2024.json",
+            "supplier_spread_eur_kwh": form["spread_eur_kwh"],
+            "quota_potenza_eur_kw_mese": form["quota_potenza_eur_kw_mese"],
+            "potenza_contrattuale_kw": round(form["picco_potenza_kw"] * 1.1),
+        },
+        "bess": {
+            "product_id":             "foxess-gmax-215",
+            "costo_installato_eur_kwh": 255,
+        },
+        "simulation": {
+            "scenari":               ["S1", "S2", "S3", "S4"],
+            "anni_analisi":          20,
+            "tasso_sconto":          0.05,
+            "om_rate":               0.01,
+            "degradazione_annua":    0.02,
+            "soglia_critical_day_pct": 0.85,
+        },
+    }
+    case["bess"] = _resolve_bess(case["bess"])
+    return case
+
+
+def _run_simulation(case: dict) -> tuple:
+    profiles = build_all_profiles(case, BASE_DIR)
+    sim      = simulate(case, profiles)
+    econ     = compute_economics(case, profiles, sim)
+    return profiles, sim, econ
+
+
+def _pick_scenario(goal: str, ha_pv: bool) -> str:
+    if goal == "Massimizzare l'autoconsumo FV" and ha_pv:
+        return "S3"
+    return "S4"
+
+
+def _assumptions(form: dict, pv_source: str) -> dict:
+    return {
+        "carico": (
+            f"Sintetico industriale — {form['consumo_annuo_kwh']:,.0f} kWh/anno, "
+            f"{form['ore_lavoro_giorno']}h/gg, {form['giorni_lavoro_settimana']}gg/sett."
+        ),
+        "pv": (
+            f"PVGIS 2020 — {form['location']}, {form['kwp']} kWp, inclinazione 30°, orientamento Sud"
+            if pv_source == "pvgis" else
+            "Sintetico — modello astronomico semplificato"
+            if form["ha_pv"] else
+            "Nessun impianto FV"
+        ),
+        "prezzi":     "ENTSO-E IT_NORD 2024 + spread fornitore",
+        "confidenza": "Medio — dati di targa e bolletta, nessuna curva misurata",
+    }
+
+
+# ── Charts ────────────────────────────────────────────────────────────────────
+
+def _chart_weekly(profiles: dict, sim: dict, scenario: str, day_start: int) -> None:
+    s0 = day_start * 96
+    s1 = s0 + 7 * 96
+    t  = np.arange(7 * 96) * SLOT_H
+
+    load   = np.array(profiles["load_kw"])[s0:s1]
+    pv     = np.array(profiles["pv_kw"])[s0:s1]
+    grid   = np.array(sim[scenario]["grid_kw"])[s0:s1]
+    charge = np.array(sim[scenario]["bess_charge_kw"])[s0:s1]
+    disc   = np.array(sim[scenario]["bess_discharge_kw"])[s0:s1]
+    soc    = np.array(sim[scenario]["soc_kwh"])[s0:s1]
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.65, 0.35], vertical_spacing=0.06,
+        subplot_titles=("Potenze (kW)", "SOC batteria (kWh)"),
+    )
+    fig.add_trace(go.Scatter(x=t, y=load,   name="Carico",       line=dict(color="#1565C0", width=2)),              row=1, col=1)
+    fig.add_trace(go.Scatter(x=t, y=pv,     name="FV",           line=dict(color="#F9A825", width=2)),              row=1, col=1)
+    fig.add_trace(go.Scatter(x=t, y=grid,   name="Rete",         line=dict(color="#757575", width=1.5, dash="dot")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=t, y=charge, name="Carica BESS",  line=dict(color="#2E7D32", width=1.5)),            row=1, col=1)
+    fig.add_trace(go.Scatter(x=t, y=-disc,  name="Scarica BESS", line=dict(color="#C62828", width=1.5)),            row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=t, y=soc, name="SOC", fill="tozeroy",
+        line=dict(color="#6A1B9A", width=1.5), fillcolor="rgba(106,27,154,0.12)",
+    ), row=2, col=1)
+    for d in range(1, 7):
+        fig.add_vline(x=d * 24, line_dash="dash", line_color="rgba(0,0,0,0.12)")
+    fig.update_xaxes(tickvals=[d * 24 + 12 for d in range(7)], ticktext=_DOW_LABELS, row=2, col=1)
+    fig.update_yaxes(title_text="kW",  row=1, col=1)
+    fig.update_yaxes(title_text="kWh", row=2, col=1)
+    fig.update_layout(
+        height=500, hovermode="x unified",
+        margin=dict(t=40, b=10, l=60, r=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="right", x=1),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _chart_cashflows(econ: dict, anni: int) -> None:
+    years = list(range(anni + 1))
+    fig   = go.Figure()
+    for sc, color in [("S3", "#1565C0"), ("S4", "#2E7D32")]:
+        if "cashflows" not in econ.get(sc, {}):
+            continue
+        cumcf = np.cumsum(econ[sc]["cashflows"]).tolist()
+        fig.add_trace(go.Scatter(
+            x=years, y=cumcf, name=sc, mode="lines+markers",
+            line=dict(color=color, width=2), marker=dict(size=4),
+        ))
+    fig.add_hline(y=0, line_dash="dash", line_color="rgba(0,0,0,0.25)")
+    fig.update_layout(
+        height=300, hovermode="x unified",
+        margin=dict(t=10, b=30, l=60, r=10),
+        xaxis_title="Anno", yaxis_title="€",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _chart_layers(econ: dict) -> None:
+    scenarios = [sc for sc in ["S3", "S4"] if "saving_fv_eur" in econ.get(sc, {})]
+    if not scenarios:
+        return
+    fig = go.Figure()
+    for label, key, color in [
+        ("Layer 1 — Autoconsumo FV", "saving_fv_eur",       "#F9A825"),
+        ("Layer 2 — Peak shaving",   "saving_quota_eur",    "#1565C0"),
+        ("Layer 3 — Shifting",       "shifting_margin_eur", "#2E7D32"),
+    ]:
+        fig.add_trace(go.Bar(
+            name=label, x=scenarios,
+            y=[econ[sc][key] for sc in scenarios],
+            marker_color=color,
+        ))
+    fig.update_layout(
+        barmode="stack", height=280,
+        margin=dict(t=10, b=30, l=60, r=10),
+        yaxis_title="€/anno",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# ── Step 1 — Input form ───────────────────────────────────────────────────────
+
+def _page_input() -> None:
+    st.markdown("# 🔋 BESS Decision Tool")
+    st.markdown(
+        "Descrivi la situazione energetica del tuo cliente. "
+        "L'app ricostruisce lo scenario, simula l'installazione di una batteria "
+        "e produce il business case."
+    )
+    st.divider()
+
+    with st.form("input_form"):
+
+        st.markdown("### 1 — Sito e consumi")
+        col1, col2 = st.columns(2)
+        with col1:
+            nome_cliente = st.text_input("Nome cliente / azienda", placeholder="Es: Toninato S.r.l.")
+            location     = st.text_input("Comune o indirizzo", placeholder="Es: Castelfranco Veneto, TV",
+                                         help="Usato per stimare la produzione FV con PVGIS")
+        with col2:
+            consumo_annuo_kwh = st.number_input(
+                "Consumo annuo (kWh)", min_value=1_000, max_value=10_000_000,
+                value=350_000, step=5_000,
+                help="Dalla bolletta: somma dei 12 mesi")
+            picco_potenza_kw = st.number_input(
+                "Picco / potenza contrattuale (kW)", min_value=10, max_value=5_000,
+                value=150, step=5,
+                help="Potenza massima del sito o potenza contrattuale")
+
+        st.markdown("### 2 — Impianto fotovoltaico")
+        col3, col4 = st.columns(2)
+        with col3:
+            ha_pv = st.checkbox("Il sito ha un impianto FV", value=True)
+        with col4:
+            kwp = st.number_input(
+                "Potenza FV installata (kWp)", min_value=0, max_value=5_000,
+                value=80, step=5,
+                help="Lascia 0 se non è presente o non è noto")
+
+        st.markdown("### 3 — Orari operativi")
+        col5, col6 = st.columns(2)
+        with col5:
+            ore_lavoro_giorno = st.number_input(
+                "Ore lavoro / giorno", min_value=1, max_value=24, value=10,
+                help="Turno di produzione tipico")
+        with col6:
+            giorni_lavoro_settimana = st.number_input(
+                "Giorni lavoro / settimana", min_value=1, max_value=7, value=5)
+
+        st.markdown("### 4 — Tariffe elettriche")
+        col7, col8 = st.columns(2)
+        with col7:
+            spread_eur_kwh = st.number_input(
+                "Spread fornitore (€/kWh)", min_value=0.0, max_value=0.5,
+                value=0.095, step=0.005, format="%.3f",
+                help="Componente commerciale aggiunta al prezzo mercato")
+        with col8:
+            quota_potenza = st.number_input(
+                "Quota potenza (€/kW/mese)", min_value=0.0, max_value=50.0,
+                value=12.0, step=0.5,
+                help="Tutte le componenti di potenza aggregate (trasmissione + distribuzione)")
+
+        st.markdown("### 5 — Obiettivo principale")
+        goal = st.radio(
+            "Cosa vuole ottenere il cliente?",
+            options=[
+                "Ridurre la bolletta elettrica",
+                "Massimizzare l'autoconsumo FV",
+                "Ridurre i picchi di potenza",
+                "Valutare se conviene una batteria",
+            ],
+            index=0,
+        )
+
+        st.divider()
+        submitted = st.form_submit_button("Analizza →", type="primary", use_container_width=True)
+
+    if not submitted:
+        return
+
+    if not nome_cliente.strip():
+        st.warning("Inserisci il nome del cliente.")
+        st.stop()
+
+    # Geocode location → lat/lon
+    lat, lon = None, None
+    if location.strip():
+        with st.spinner(f"Geocoding '{location}'..."):
+            coords = _geocode(location.strip())
+        if coords:
+            lat, lon = coords
+        else:
+            st.warning(
+                f"Posizione '{location}' non trovata. "
+                "Uso coordinate default Nord Italia. "
+                "PVGIS sarà meno preciso — prova con un nome più specifico."
+            )
+
+    form = {
+        "nome_cliente":             nome_cliente.strip(),
+        "location":                 location.strip() or "Sito",
+        "consumo_annuo_kwh":        consumo_annuo_kwh,
+        "picco_potenza_kw":         picco_potenza_kw,
+        "ha_pv":                    ha_pv,
+        "kwp":                      kwp if ha_pv else 0,
+        "ore_lavoro_giorno":        ore_lavoro_giorno,
+        "giorni_lavoro_settimana":  giorni_lavoro_settimana,
+        "spread_eur_kwh":           spread_eur_kwh,
+        "quota_potenza_eur_kw_mese": quota_potenza,
+        "goal":                     goal,
+        "lat":                      lat,
+        "lon":                      lon,
+    }
+
+    case = _build_case(form)
+
+    with st.spinner("Simulazione in corso..."):
+        t0 = time.perf_counter()
+        profiles, sim, econ = _run_simulation(case)
+        elapsed = time.perf_counter() - t0
+
+    st.session_state.update({
+        "step":     "results",
+        "form":     form,
+        "case":     case,
+        "profiles": profiles,
+        "sim":      sim,
+        "econ":     econ,
+        "elapsed":  elapsed,
+    })
+    st.rerun()
+
+
+# ── Step 2 — Results ──────────────────────────────────────────────────────────
+
+def _page_results() -> None:
+    form     = st.session_state["form"]
+    case     = st.session_state["case"]
+    profiles = st.session_state["profiles"]
+    sim      = st.session_state["sim"]
+    econ     = st.session_state["econ"]
+    elapsed  = st.session_state.get("elapsed", 0)
+
+    ha_pv     = form["ha_pv"] and form["kwp"] > 0
+    pv_source = case["pv"]["profilo_source"]
+    best_sc   = _pick_scenario(form["goal"], ha_pv)
+    e_best    = econ.get(best_sc, {})
+    assum     = _assumptions(form, pv_source)
+
+    # ── Header + back button ──────────────────────────────────────────────────
+    col_h, col_b = st.columns([6, 1])
+    with col_h:
+        st.markdown(f"# Soluzione per {form['nome_cliente']}")
+    with col_b:
+        st.markdown("<div style='padding-top:1.1rem'></div>", unsafe_allow_html=True)
+        if st.button("← Modifica", use_container_width=True):
+            st.session_state["step"] = "input"
+            st.rerun()
+
+    # ── Assumptions box ───────────────────────────────────────────────────────
+    with st.expander("📋 Come abbiamo ricostruito lo scenario", expanded=False):
+        st.markdown(f"- **Profilo di carico:** {assum['carico']}")
+        st.markdown(f"- **Produzione FV:** {assum['pv']}")
+        st.markdown(f"- **Prezzi energia:** {assum['prezzi']}")
+        st.markdown(f"- **Livello di confidenza:** {assum['confidenza']}")
+        st.caption(f"Simulazione completata in {elapsed:.1f}s · Scenario primario: {best_sc}")
+
+    st.divider()
+
+    # ── Product + primary KPIs ────────────────────────────────────────────────
+    bess     = case["bess"]
+    cap_kwh  = bess.get("capacita_nominale_kwh", 215)
+    pow_kw   = bess.get("potenza_nominale_kw",   100)
+    cost_kwh = bess.get("costo_installato_eur_kwh", 255)
+    invest   = cap_kwh * cost_kwh
+    sc_label = "multilayer (S4)" if best_sc == "S4" else "autoconsumo (S3)"
+
+    st.markdown(f"### 🔋 Fox ESS G-MAX &nbsp; {cap_kwh} kWh / {pow_kw} kW &nbsp;·&nbsp; Strategia: {sc_label}")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Investimento",    f"{invest:,.0f} €")
+    c2.metric("Risparmio annuo", f"{e_best.get('annual_saving_eur', 0):,.0f} €/anno")
+    pb = e_best.get("payback_yr")
+    c3.metric("Payback",         f"{pb} anni" if pb else "— anni")
+    c4.metric("NPV (20 anni)",   f"{e_best.get('npv_eur', 0):,.0f} €")
+    irr = e_best.get("irr_pct")
+    c5.metric("IRR",             f"{irr} %" if irr is not None else "—")
+
+    st.divider()
+
+    # ── Energy profile summary ────────────────────────────────────────────────
+    load_kw = np.array(profiles["load_kw"])
+    pv_kw   = np.array(profiles["pv_kw"])
+    price   = np.array(profiles["price_eur_kwh"])
+
+    st.markdown("#### Profili annuali ricostruiti")
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Consumo annuo",    f"{load_kw.sum() * SLOT_H:,.0f} kWh",
+              f"picco {load_kw.max():.1f} kW")
+    if ha_pv:
+        p2.metric("Produzione FV", f"{pv_kw.sum() * SLOT_H:,.0f} kWh",
+                  f"picco {pv_kw.max():.1f} kW")
+    else:
+        p2.metric("Produzione FV", "—", "Nessun impianto FV")
+    e_s2 = econ.get("S2", {})
+    e_s1 = econ.get("S1", {})
+    s2_cost = e_s2.get("annual_energy_cost_eur", 0)
+    s1_cost = e_s1.get("annual_energy_cost_eur", 0)
+    p3.metric("Costo energia attuale (con FV)",
+              f"{s2_cost:,.0f} €/anno" if ha_pv else f"{s1_cost:,.0f} €/anno",
+              f"−{s1_cost - s2_cost:,.0f} € grazie al FV" if ha_pv else "senza FV")
+    p4.metric("Prezzo medio energia",
+              f"{price.mean():.4f} €/kWh",
+              f"range {price.min():.3f}–{price.max():.3f}")
+
+    st.divider()
+
+    # ── Business case detail — tabs ────────────────────────────────────────────
+    st.markdown("#### Business case di dettaglio")
+    tab1, tab2, tab3 = st.tabs(["Risparmio per layer", "Flussi di cassa", "Vista tecnica"])
+
+    with tab1:
+        _chart_layers(econ)
+        st.caption(
+            "Layer 1: risparmio FV via batteria (energia FV autoconsumata anziché esportata). "
+            "Layer 2: riduzione quota potenza (peak shaving). "
+            "Layer 3: arbitraggio prezzi orari (shifting). "
+            "I layer derivano da un'unica simulazione — non sono indipendenti."
+        )
+        e3 = econ.get("S3", {})
+        e4 = econ.get("S4", {})
+        if e3 and e4:
+            st.markdown("**S3 vs S4 — confronto scenari**")
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("S3 risparmio", f"{e3.get('annual_saving_eur', 0):,.0f} €/anno")
+            d2.metric("S4 risparmio", f"{e4.get('annual_saving_eur', 0):,.0f} €/anno")
+            d3.metric("S3 NPV",       f"{e3.get('npv_eur', 0):,.0f} €")
+            d4.metric("S4 NPV",       f"{e4.get('npv_eur', 0):,.0f} €")
+            st.caption(
+                "S3 = solo autoconsumo FV.  "
+                "S4 = multilayer (autoconsumo + peak shaving + shifting).  "
+                f"Scenario primario mostrato sopra: **{best_sc}** "
+                f"(scelto in base all'obiettivo: «{form['goal']}»)."
+            )
+
+    with tab2:
+        _chart_cashflows(econ, case["simulation"]["anni_analisi"])
+        repl_yr = e_best.get("battery_replacement_year")
+        if repl_yr:
+            repl_cost = e_best.get("replacement_capex_eur", 0)
+            st.caption(f"Sostituzione batteria inclusa all'anno {repl_yr} ({repl_cost:,.0f} €).")
+        else:
+            st.caption("Orizzonte di analisi: 20 anni. Tasso di sconto: 5%.")
+
+    with tab3:
+        season = st.selectbox("Stagione", list(_SEASON_DAYS.keys()), key="season_sel")
+        _chart_weekly(profiles, sim, best_sc, _SEASON_DAYS[season])
+        st.caption(
+            f"Vista tecnica settimanale — Scenario {best_sc}.  "
+            "Carico, FV, potenza batteria e stato di carica (SOC) slot per slot."
+        )
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    st.set_page_config(
+        page_title="BESS Decision Tool",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
+    if "step" not in st.session_state:
+        st.session_state["step"] = "input"
+
+    if st.session_state["step"] == "input":
+        _page_input()
+    else:
+        _page_results()
+
+
+if __name__ == "__main__":
+    main()
