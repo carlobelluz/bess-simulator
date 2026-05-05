@@ -23,8 +23,8 @@
   "pv": {
     "presente": true,
     "kwp": 80,
-    "producibilita_annua_kwh": 96000,
-    "profilo_source": "sintetico",
+    "profilo_source": "pvgis",
+    "_pvgis_note": "Usa lat/lon da site. Parametri opzionali: pvgis_tilt (default 30), pvgis_azimuth (default 0=sud), pvgis_losses_pct (default 14), pvgis_year (default 2023).",
     "fv_export_regime": "nessuno",
     "fv_export_value_eur_kwh": null
   },

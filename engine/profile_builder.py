@@ -3,16 +3,21 @@ profile_builder.py
 Generates the three annual arrays needed by the simulation engine:
   load_kw, pv_kw, price_eur_kwh  —  all at 15-min resolution (35,040 slots).
 
-v1: fully synthetic. Each function has a SWAP marker showing where a real
-data source plugs in later:
+PV data sources (pv.profilo_source):
+  "sintetico"  → mathematical clear-sky model (no network, always works)
+  "pvgis"      → PVGIS API (JRC/EU), requires lat/lon in site dict.
+                 Result cached in pvgis_cache/ — API called only once.
+
+SWAP markers for future real-data sources:
   SWAP_LOAD  → CSV reader with measured 15-min load curve
-  SWAP_PV    → PVGIS API client
   SWAP_PRICE → ENTSO-E real data loader (already wired; just populate the JSON)
 """
 
 import json
 import math
 import os
+import urllib.request
+import urllib.parse
 import numpy as np
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -50,7 +55,7 @@ def build_all_profiles(case: dict, base_dir: str = ".") -> dict:
     ti = _make_time_index()
     return {
         "load_kw":       build_load_profile(case["site"], ti),
-        "pv_kw":         build_pv_profile(case["pv"], ti),
+        "pv_kw":         build_pv_profile(case["pv"], ti, case.get("site"), base_dir),
         "price_eur_kwh": build_price_profile(case["tariffs"], base_dir, ti),
         "slot_hours":    SLOT_H,
         "n_slots":       N_SLOTS,
@@ -68,16 +73,22 @@ def build_load_profile(site: dict, ti: dict | None = None) -> np.ndarray:
     return _synthetic_load(site, ti)
 
 
-def build_pv_profile(pv: dict, ti: dict | None = None) -> np.ndarray:
+def build_pv_profile(pv: dict, ti: dict | None = None,
+                     site: dict | None = None, base_dir: str = ".") -> np.ndarray:
     """
     Returns annual PV production profile in kW (35040 slots).
     Returns zeros if pv.presente is false.
-    SWAP_PV: replace _synthetic_pv() body with PVGIS client.
+
+    pv.profilo_source controls the data source:
+      "sintetico"  → mathematical model (default)
+      "pvgis"      → PVGIS API (requires lat/lon in site or pv dict)
     """
     if not pv.get("presente", False):
         return np.zeros(N_SLOTS)
     if ti is None:
         ti = _make_time_index()
+    if pv.get("profilo_source") == "pvgis":
+        return _pvgis_pv(pv, site or {}, base_dir)
     return _synthetic_pv(pv)
 
 
@@ -216,6 +227,114 @@ def _synthetic_pv(pv: dict) -> np.ndarray:
 
     # Upsample to 15-min — production is uniform within each hour
     return np.maximum(np.repeat(pv_h, SLOTS_PER_H), 0.0)
+
+
+# ── PVGIS PV ──────────────────────────────────────────────────────────────────
+
+_PVGIS_URL = "https://re.jrc.ec.europa.eu/api/v5_2/seriescalc"
+
+def _pvgis_pv(pv: dict, site: dict, base_dir: str = ".") -> np.ndarray:
+    """
+    Fetches hourly PV production from the PVGIS API (JRC/EU, free, no auth).
+
+    lat/lon are read from site first, then from pv (allows override).
+    Results are cached in pvgis_cache/ — the API is called only once per
+    unique combination of parameters.
+
+    Falls back to _synthetic_pv() if the API is unreachable or returns
+    unexpected data.
+
+    Key pv-dict parameters (all optional, sensible Italian defaults):
+      pvgis_year         int  — meteorological year (2005-2020, default 2020)
+      pvgis_tilt         int  — panel tilt in degrees, 0=horizontal (default 30)
+      pvgis_azimuth      int  — azimuth: 0=south, -90=east, 90=west (default 0)
+      pvgis_losses_pct   int  — system losses % (default 14)
+    """
+    lat = site.get("lat") or pv.get("lat")
+    lon = site.get("lon") or pv.get("lon")
+    kwp = pv["kwp"]
+
+    if lat is None or lon is None:
+        print("  [PVGIS] lat/lon mancante nel case file — fallback sintetico")
+        return _synthetic_pv(pv)
+
+    year    = pv.get("pvgis_year",       2020)   # PVGIS v5.2: range 2005-2020
+    tilt    = pv.get("pvgis_tilt",         30)
+    azimuth = pv.get("pvgis_azimuth",       0)
+    losses  = pv.get("pvgis_losses_pct",   14)
+
+    # ── Cache ─────────────────────────────────────────────────────────────────
+    cache_dir  = os.path.join(base_dir, "pvgis_cache")
+    cache_name = (f"pvgis_{lat:.3f}_{lon:.3f}_{kwp}kw"
+                  f"_y{year}_t{tilt}_az{azimuth}_l{losses}.json")
+    cache_path = os.path.join(cache_dir, cache_name)
+
+    if os.path.exists(cache_path):
+        with open(cache_path) as f:
+            cached = json.load(f)
+        hours_kw = np.array(cached["hours"], dtype=float)
+        if len(hours_kw) == N_HOURS:
+            print(f"  [PVGIS] cache — {cached.get('_producibilita_kwh', '?'):,.0f} kWh/anno"
+                  f"  picco {cached.get('_picco_kw', '?'):.1f} kW")
+            return np.maximum(np.repeat(hours_kw, SLOTS_PER_H), 0.0)
+
+    # ── API call ──────────────────────────────────────────────────────────────
+    params = {
+        "lat":            lat,
+        "lon":            lon,
+        "peakpower":      kwp,
+        "pvcalculation":  1,      # return P (W) in addition to irradiance
+        "loss":           losses,
+        "angle":          tilt,
+        "aspect":         azimuth,
+        "outputformat":   "json",
+        "startyear":      year,
+        "endyear":        year,
+    }
+    url = _PVGIS_URL + "?" + urllib.parse.urlencode(params)
+
+    try:
+        print(f"  [PVGIS] scarico lat={lat}, lon={lon}, {kwp} kWp, anno {year}...")
+        req = urllib.request.Request(url, headers={"User-Agent": "bess-simulator/0.1"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+
+        hourly = data["outputs"]["hourly"]
+        pv_w   = np.array([h["P"] for h in hourly], dtype=float)
+
+        # Remove Feb 29 if leap year (8784 h → 8760 h)
+        if len(pv_w) == 8784:
+            feb29_start = (31 + 28) * 24
+            pv_w = np.delete(pv_w, np.arange(feb29_start, feb29_start + 24))
+
+        if len(pv_w) != N_HOURS:
+            raise ValueError(f"attese {N_HOURS} ore, ricevute {len(pv_w)}")
+
+        hours_kw = pv_w / 1000.0          # W → kW
+        prod_kwh = float(hours_kw.sum())
+        peak_kw  = float(hours_kw.max())
+
+        print(f"  [PVGIS] {prod_kwh:,.0f} kWh/anno  picco {peak_kw:.1f} kW  "
+              f"→ salvato in cache")
+
+        # Save to cache
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump({
+                "_source":            "pvgis",
+                "_params":            {"lat": lat, "lon": lon, "kwp": kwp,
+                                       "year": year, "tilt": tilt,
+                                       "azimuth": azimuth, "losses": losses},
+                "_producibilita_kwh": round(prod_kwh, 0),
+                "_picco_kw":          round(peak_kw, 2),
+                "hours":              hours_kw.tolist(),
+            }, f, indent=2)
+
+        return np.maximum(np.repeat(hours_kw, SLOTS_PER_H), 0.0)
+
+    except Exception as e:
+        print(f"  [PVGIS] errore: {e} — fallback sintetico")
+        return _synthetic_pv(pv)
 
 
 # ── Market price loader ────────────────────────────────────────────────────────

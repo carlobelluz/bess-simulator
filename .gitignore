@@ -18,5 +18,8 @@ results/
 # Credenziali locali — mai su GitHub
 .env
 
+# Cache PVGIS — generata automaticamente, non necessaria su GitHub
+pvgis_cache/
+
 # Jupyter
 .ipynb_checkpoints/
