@@ -1,0 +1,57 @@
+{
+  "_schema_version": "1.0",
+  "_note": "Example case: Toninato S.r.l. — industrial site with PV, candidate for BESS multilayer",
+
+  "meta": {
+    "case_id": "toninato-001",
+    "nome_cliente": "Toninato S.r.l.",
+    "nome_sito": "Stabilimento di Castelfranco Veneto",
+    "data_creazione": "2026-05-05",
+    "autore": "Carlo Belluz"
+  },
+
+  "site": {
+    "consumo_annuo_kwh": 350000,
+    "picco_potenza_kw": 150,
+    "profilo_tipo": "industriale_standard",
+    "ore_lavoro_giorno": 10,
+    "giorni_lavoro_settimana": 5,
+    "lat": 45.68,
+    "lon": 11.92
+  },
+
+  "pv": {
+    "presente": true,
+    "kwp": 80,
+    "producibilita_annua_kwh": 96000,
+    "profilo_source": "sintetico"
+  },
+
+  "tariffs": {
+    "market_price_series": "prices/it_nord_2024.json",
+    "supplier_spread_eur_kwh": 0.095,
+    "quota_potenza_eur_kw_mese": 12.0,
+    "potenza_contrattuale_kw": 160
+  },
+
+  "bess": {
+    "capacita_nominale_kwh": 200,
+    "potenza_carica_kw": 100,
+    "potenza_scarica_kw": 100,
+    "soc_min": 0.05,
+    "soc_max": 0.95,
+    "efficienza_roundtrip": 0.90,
+    "costo_installato_eur_kwh": 255,
+    "anni_vita": 15
+  },
+
+  "simulation": {
+    "scenari": ["S1", "S2", "S3", "S4"],
+    "anni_analisi": 20,
+    "tasso_sconto": 0.05,
+    "om_rate": 0.01,
+    "degradazione_annua": 0.02,
+    "soglia_critical_day_pct": 0.85,
+    "_s4_charging_strategy": "PROVISIONAL — engine-side decision, not locked. To be defined before engine implementation."
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "_note": "PLACEHOLDER — replace with real ENTSO-E data before running simulations",
+  "_source": "ENTSO-E Transparency Platform — Day-Ahead Prices",
+  "_url": "https://transparency.entsoe.eu/transmission-domain/r2/dayAheadPrices/show",
+  "_zone": "IT_NORD",
+  "_year": 2024,
+  "_unit": "EUR_MWh",
+  "_count": 8760,
+  "_status": "placeholder — synthetic approximate profile, NOT real market data",
+
+  "source": "ENTSO-E",
+  "zone": "IT_NORD",
+  "year": 2024,
+  "unit": "EUR_MWh",
+  "hours": null
+}

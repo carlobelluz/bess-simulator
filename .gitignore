@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Results (file grandi, generati dal programma)
+results/
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/
+
+# Jupyter
+.ipynb_checkpoints/
