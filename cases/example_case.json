@@ -38,14 +38,9 @@
   },
 
   "bess": {
-    "capacita_nominale_kwh": 200,
-    "potenza_carica_kw": 100,
-    "potenza_scarica_kw": 100,
-    "soc_min": 0.05,
-    "soc_max": 0.95,
-    "efficienza_roundtrip": 0.90,
+    "product_id": "foxess-gmax-215",
     "costo_installato_eur_kwh": 255,
-    "anni_vita": 15
+    "_note": "Tutti i parametri tecnici vengono dal catalogo prodotto. Aggiungere qui solo override espliciti (es. efficienza_roundtrip: 0.9336 per scenario ottimistico)."
   },
 
   "simulation": {

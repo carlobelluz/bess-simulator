@@ -34,6 +34,9 @@ def main() -> None:
         case = json.load(f)
     case_id = case["meta"]["case_id"]
 
+    # ── Resolve BESS product params ───────────────────────────────────────────
+    case["bess"] = _resolve_bess(case["bess"], base_dir)
+
     print(f"Case      : {case_id}  ({case['meta']['nome_cliente']})")
     print(f"Site      : {case['meta']['nome_sito']}")
     print()
@@ -133,6 +136,39 @@ def _print_summary(econ: dict, profiles: dict) -> None:
               f"payback {pb}   "
               f"NPV {e['npv_eur']:>9,.0f} €   "
               f"IRR {e['irr_pct']}%")
+
+
+def _resolve_bess(bess: dict, base_dir: str) -> dict:
+    """
+    Merges product catalog simulation_defaults with case-file overrides.
+    If no product_id, returns bess unchanged (backwards compatible).
+    Case file always wins over catalog defaults.
+    """
+    product_id = bess.get("product_id")
+    if not product_id:
+        return bess
+
+    product_path = os.path.join(base_dir, "products", f"{product_id}.json")
+    if not os.path.exists(product_path):
+        print(f"ERROR: product catalog not found: {product_path}")
+        sys.exit(1)
+
+    with open(product_path) as f:
+        product = json.load(f)
+
+    defaults = product["simulation_defaults"]
+
+    # Map potenza_nominale_kw → potenza_carica_kw / potenza_scarica_kw
+    if "potenza_nominale_kw" in defaults:
+        defaults.setdefault("potenza_carica_kw",  defaults["potenza_nominale_kw"])
+        defaults.setdefault("potenza_scarica_kw", defaults["potenza_nominale_kw"])
+
+    # Strip internal metadata fields (annotations, not engine params)
+    clean = {k: v for k, v in defaults.items()
+             if not k.startswith("_") and not k.endswith("_fonte") and "override" not in k}
+
+    # Case file overrides win; product_id kept for traceability
+    return {**clean, **bess}
 
 
 if __name__ == "__main__":
