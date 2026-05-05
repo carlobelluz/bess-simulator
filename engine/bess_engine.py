@@ -125,6 +125,7 @@ def _run_s3(load_kw: np.ndarray, pv_kw: np.ndarray, bp: dict) -> dict:
     discharged_fv_kwh   = np.zeros(N_SLOTS)
     discharged_grid_kwh = np.zeros(N_SLOTS)
     charged_grid_kwh    = np.zeros(N_SLOTS)   # always 0 in S3
+    charged_fv_ac_kwh   = np.zeros(N_SLOTS)
 
     soc    = soc_min
     soc_fv = 0.0   # kWh of SOC that originated from PV
@@ -141,6 +142,7 @@ def _run_s3(load_kw: np.ndarray, pv_kw: np.ndarray, bp: dict) -> dict:
             e_in    = p_c * eta_c * SLOT_H
             soc    += e_in
             soc_fv += e_in
+            charged_fv_ac_kwh[t] = p_c * SLOT_H
 
         elif net > 0:   # load deficit → discharge battery
             p_d_avail = (soc - soc_min) * eta_d / SLOT_H
@@ -167,6 +169,7 @@ def _run_s3(load_kw: np.ndarray, pv_kw: np.ndarray, bp: dict) -> dict:
         discharged_fv_kwh=discharged_fv_kwh,
         discharged_grid_kwh=discharged_grid_kwh,
         charged_grid_kwh=charged_grid_kwh,
+        charged_fv_ac_kwh=charged_fv_ac_kwh,
     )
 
 
@@ -243,6 +246,7 @@ def _run_s4(
     discharged_fv_kwh   = np.zeros(N_SLOTS)
     discharged_grid_kwh = np.zeros(N_SLOTS)
     charged_grid_kwh    = np.zeros(N_SLOTS)
+    charged_fv_ac_kwh   = np.zeros(N_SLOTS)
 
     soc    = soc_min
     soc_fv = 0.0
@@ -262,6 +266,7 @@ def _run_s4(
                 e_in    = p_c * eta_c * SLOT_H
                 soc    += e_in
                 soc_fv += e_in
+                charged_fv_ac_kwh[t] = p_c * SLOT_H
 
             elif net > shaving_target[d]:            # grid draw exceeds target
                 excess    = net - shaving_target[d]
@@ -287,6 +292,7 @@ def _run_s4(
                 e_in    = p_c * eta_c * SLOT_H
                 soc    += e_in
                 soc_fv += e_in
+                charged_fv_ac_kwh[t] = p_c * SLOT_H
 
             elif net > 0:                            # load deficit → discharge
                 p_d_avail = (soc - soc_min) * eta_d / SLOT_H
@@ -325,6 +331,7 @@ def _run_s4(
         discharged_fv_kwh=discharged_fv_kwh,
         discharged_grid_kwh=discharged_grid_kwh,
         charged_grid_kwh=charged_grid_kwh,
+        charged_fv_ac_kwh=charged_fv_ac_kwh,
     )
 
 
@@ -338,6 +345,7 @@ def _make_result(
     discharged_fv_kwh:   np.ndarray | None = None,
     discharged_grid_kwh: np.ndarray | None = None,
     charged_grid_kwh:    np.ndarray | None = None,
+    charged_fv_ac_kwh:   np.ndarray | None = None,
 ) -> dict:
     """Packs scenario arrays into a uniform result dict; absent arrays → zeros."""
     z = np.zeros(N_SLOTS)
@@ -349,6 +357,7 @@ def _make_result(
         "discharged_fv_kwh":   z.copy() if discharged_fv_kwh   is None else np.asarray(discharged_fv_kwh,   dtype=float),
         "discharged_grid_kwh": z.copy() if discharged_grid_kwh is None else np.asarray(discharged_grid_kwh, dtype=float),
         "charged_grid_kwh":    z.copy() if charged_grid_kwh    is None else np.asarray(charged_grid_kwh,    dtype=float),
+        "charged_fv_ac_kwh":   z.copy() if charged_fv_ac_kwh   is None else np.asarray(charged_fv_ac_kwh,   dtype=float),
     }
 
 

@@ -43,6 +43,7 @@ def compute_economics(case: dict, profiles: dict, results: dict) -> dict:
     discount_rate   = sim["tasso_sconto"]
     om_rate         = sim["om_rate"]
     degradazione    = sim["degradazione_annua"]
+    anni_vita       = bess.get("anni_vita", anni + 1)
     cap_nom         = bess["capacita_nominale_kwh"]
     eta_d           = np.sqrt(bess["efficienza_roundtrip"])
 
@@ -66,10 +67,14 @@ def compute_economics(case: dict, profiles: dict, results: dict) -> dict:
         grid_kw = r_sc["grid_kw"]
 
         # ── Layer 1: FV self-consumption saving ───────────────────────────────
-        # discharged_fv_kwh[t] = DC kWh from PV-sourced SOC
-        # AC energy delivered   = discharged_fv_kwh[t] * eta_d
-        # Valued at spot price  = price[t]
-        saving_fv = (r_sc["discharged_fv_kwh"] * eta_d * price).sum()
+        # Gross value: DC kWh discharged × η_d (→ AC kWh) × price at discharge
+        # Opportunity cost: AC kWh taken from FV surplus for charging ×
+        #   export value foregone (0 if no incentive scheme, price if SSP, etc.)
+        export_value = _get_export_value(case["pv"], price)
+        saving_fv = float(
+            (r_sc["discharged_fv_kwh"] * eta_d * price).sum()
+            - (r_sc["charged_fv_ac_kwh"] * export_value).sum()
+        )
 
         # ── Layer 2: quota potenza saving — S4 only ───────────────────────────
         # Reduction in monthly demand peak × monthly power tariff.
@@ -98,12 +103,19 @@ def compute_economics(case: dict, profiles: dict, results: dict) -> dict:
         eq_cycles  = throughput / cap_nom if cap_nom > 0 else 0.0
 
         # ── Multi-year cash flows ─────────────────────────────────────────────
-        om_annual  = investment * om_rate
-        cash_flows = np.empty(anni + 1)
+        om_annual         = investment * om_rate
+        replacement_capex = investment if anni_vita <= anni else 0.0
+
+        cash_flows    = np.empty(anni + 1)
         cash_flows[0] = -investment
         for y in range(1, anni + 1):
-            saving_y       = annual_saving * (1.0 - degradazione) ** (y - 1)
-            cash_flows[y]  = saving_y - om_annual
+            # After battery replacement, degradation exponent resets to 0
+            exponent      = y - 1 if (anni_vita > anni or y <= anni_vita) else y - anni_vita - 1
+            saving_y      = annual_saving * (1.0 - degradazione) ** exponent
+            cash_flows[y] = saving_y - om_annual
+        # Replacement capex at end of year anni_vita (same year as last operating year)
+        if anni_vita <= anni:
+            cash_flows[anni_vita] -= replacement_capex
 
         payback = _payback(cash_flows)
         npv_val = float(npf.npv(discount_rate, cash_flows))
@@ -126,10 +138,13 @@ def compute_economics(case: dict, profiles: dict, results: dict) -> dict:
             "investment_eur":      round(investment, 2),
             "om_annual_eur":       round(om_annual, 2),
             # Financial KPIs
-            "payback_yr":          payback,
-            "npv_eur":             round(npv_val, 2),
-            "irr_pct":             irr_val,
-            "cashflows":           cash_flows.tolist(),
+            "payback_yr":               payback,
+            "npv_eur":                  round(npv_val, 2),
+            "irr_pct":                  irr_val,
+            "cashflows":                cash_flows.tolist(),
+            # Battery lifecycle
+            "battery_replacement_year": anni_vita if anni_vita <= anni else None,
+            "replacement_capex_eur":    round(replacement_capex, 2),
         }
 
     return out
@@ -202,6 +217,30 @@ def _payback(cash_flows: np.ndarray) -> float | None:
                 return round(y - 1 + frac, 2)
             return float(y)
     return None
+
+
+def _get_export_value(pv: dict, price: np.ndarray) -> float | np.ndarray:
+    """
+    Returns the per-slot value (€/kWh) of FV energy exported to the grid.
+
+    Used to compute the opportunity cost of storing FV energy in the battery
+    rather than exporting it — which is the correct basis for Layer 1.
+
+    Regime mapping:
+      "nessuno"          → 0.0  (no export incentive — current default)
+      "ritiro_dedicato"  → ~85% of market price (GME PUN minus handling fee)
+      "ssp"              → full import price (Scambio sul Posto: 1:1 virtual net metering)
+      explicit value     → fv_export_value_eur_kwh overrides regime
+    """
+    explicit = pv.get("fv_export_value_eur_kwh")
+    if explicit is not None:
+        return float(explicit)
+    regime = pv.get("fv_export_regime", "nessuno")
+    if regime == "ssp":
+        return price                  # full import price per slot
+    if regime == "ritiro_dedicato":
+        return price * 0.85           # approximate: market without taxes/spread
+    return 0.0                        # "nessuno" — preserves current behaviour
 
 
 # ── Quick sanity check ────────────────────────────────────────────────────────

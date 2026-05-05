@@ -24,14 +24,17 @@
     "presente": true,
     "kwp": 80,
     "producibilita_annua_kwh": 96000,
-    "profilo_source": "sintetico"
+    "profilo_source": "sintetico",
+    "fv_export_regime": "nessuno",
+    "fv_export_value_eur_kwh": null
   },
 
   "tariffs": {
     "market_price_series": "prices/it_nord_2024.json",
     "supplier_spread_eur_kwh": 0.095,
     "quota_potenza_eur_kw_mese": 12.0,
-    "potenza_contrattuale_kw": 160
+    "potenza_contrattuale_kw": 160,
+    "_quota_potenza_note": "Assumption: billing on single monthly peak kW. All demand-charge components (trasmissione, distribuzione, quota potenza) aggregated into quota_potenza_eur_kw_mese. Penalties for exceeding potenza_contrattuale_kw are not modelled."
   },
 
   "bess": {

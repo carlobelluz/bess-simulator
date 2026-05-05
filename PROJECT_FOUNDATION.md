@@ -1,217 +1,153 @@
-# PROJECT_FOUNDATION.md
-## BESS Tool — MVP 0.1
+# BESS Tool MVP — Project Foundation
+
+## Objective
+
+Build a local, usable simulation and business case tool for industrial BESS (Battery Energy Storage System) installations.
+
+The tool answers one question:
+> "If I install a BESS here, how can I use it, what value does it generate, and what size makes sense?"
 
 ---
 
-## 1. Stato attuale della cartella
+## Target users
 
-La cartella `bess 0.1/` è pulita: solo CLAUDE.md e README.md.
-Il lavoro precedente esiste in `bess-dashboard/` (simulatore.py, dashboard.html, hello.py).
-Quel lavoro è un **calcolatore finanziario grezzo**, non un simulatore reale.
-Il BESS non viene simulato slot per slot — viene approssimato con formule fisse.
-Questa è la differenza fondamentale che il nuovo MVP deve colmare.
-
----
-
-## 2. Architettura MVP
-
-```
-case file JSON
-      ↓
-profile_builder.py   ← genera profilo annuale 15-min (sintetico o da CSV)
-      ↓
-bess_engine.py       ← simula slot per slot i 4 scenari
-      ↓
-economics.py         ← calcola KPI economici e business plan
-      ↓
-results.json         ← output strutturato
-      ↓
-dashboard.py         ← Streamlit: grafici + KPI + business plan
-```
-
-**Principio chiave**: il motore gira una volta (CLI o da dashboard), produce `results.json`.
-La dashboard legge solo quel file — nessun calcolo nella UI.
+| User | Role | What they need |
+|---|---|---|
+| Carlo (consultant) | Runs the tool with the client | Fast, credible numbers in a meeting |
+| Industrial client | Sees the output | Clear benefit and return on investment |
+| Financiers | Reads the report | IRR, NPV, cash flow to evaluate financing |
 
 ---
 
-## 3. Struttura file
+## MVP scope — what is included
+
+- One real commercial BESS reference product (G-MAX, ~255 €/kWh installed)
+- Standardized case input file (JSON)
+- Full simulation engine (S1 → S4), 15-minute slots, 35,040 per year
+- Seasonal technical visualization (weekly representative profile per season)
+- Separate KPI layers: self-consumption FV, peak shaving, shifting
+- Business case output: payback, NPV, IRR
+
+## MVP scope — what is NOT included
+
+- Generic import from arbitrary customer files (PDF bills, CSV load curves)
+- Full product catalog
+- Full incentive / subsidy engine
+- SaaS or multi-user architecture
+- Bank-grade due diligence workflow
+- Automatic sizing optimizer (sweep over sizes)
+- Real-time market prices (MGP/GME)
+
+---
+
+## Scenarios
+
+| ID | Description |
+|---|---|
+| S1 | Baseline — no PV, no BESS |
+| S2 | Current state — PV active, no BESS |
+| S3 | BESS for self-consumption only — charges from PV surplus, discharges on load |
+| S4 | BESS multilayer — self-consumption + peak shaving + time shifting |
+
+---
+
+## Required outputs
+
+### Technical
+- Seasonal weekly profile charts: load, PV, BESS charge, BESS discharge, grid draw, SOC
+- Annual technical KPIs: energy self-consumed, peak reduction, battery throughput, equivalent cycles
+
+### Economic (layers kept separate)
+- Saving from FV via BESS (self-consumption gain)
+- Saving from peak shaving (power charge reduction)
+- Shifting margin (night charge cost vs daytime discharge value)
+- Total annual saving, payback, NPV, IRR
+
+---
+
+## Modelling principles
+
+The BESS is not an abstract box. The model always uses:
+
+| Parameter | Notes |
+|---|---|
+| Nominal capacity (kWh) | Commercial product size |
+| Usable capacity | SOC min 5% — SOC max 95% |
+| Charge/discharge power (kW) | C-rate limit |
+| Round-trip efficiency | 90% (√0.90 applied both ways) |
+| Equivalent annual cycles | Tracked from throughput |
+| Operational limits | Hard constraints per slot |
+
+### Peak shaving logic
+Selective: only on "critical days" (daily peak ≥ 85% of monthly peak).
+Clipping threshold calculated dynamically via bisection to use exactly the available energy.
+
+### FV quota tracking
+SOC tracks separately how much stored energy comes from PV vs grid.
+Required to avoid double-counting across economic layers.
+
+### Grid charging (shifting)
+Only in winter months (Jan, Feb, Nov, Dec), only at night (00:00–07:00).
+Power distributed evenly across the window to avoid creating artificial peaks.
+
+---
+
+## Validation case: Toninato
+
+This is the reference case used to verify the engine is correct.
+
+| Output | Target value |
+|---|---|
+| S3 annual saving | ~6,225 €/anno |
+| S4 annual saving | ~7,010 €/anno |
+| Investment (approx) | ~55,000 € |
+| Simple payback | ~7.8 anni |
+
+If the engine produces these numbers on the Toninato case, it is validated.
+
+**Open item:** exact input parameters for Toninato (kWh/anno, kW peak, kWp PV, €/kWh, €/kW/month) — to be confirmed by Carlo before running validation.
+
+---
+
+## File architecture
 
 ```
 bess 0.1/
-├── CLAUDE.md
-├── README.md
-├── PROJECT_FOUNDATION.md         ← questo file
-├── requirements.txt
-│
-├── cases/
-│   └── example_case.json         ← il contratto dati: tutto parte da qui
-│
-├── engine/
-│   ├── __init__.py
-│   ├── bess_engine.py            ← simulazione slot per slot (S1-S4)
-│   ├── profile_builder.py        ← profilo 35.040 slot/anno
-│   └── economics.py              ← payback, NPV, IRR, layer economici
-│
-├── run_simulation.py             ← CLI: legge case, gira motore, scrive results.json
-│
-├── results/
-│   └── (results_*.json)          ← output generati
-│
-└── dashboard.py                  ← Streamlit: legge results.json, mostra tutto
+├── CLAUDE.md                  ← operating brief for Claude in this project
+├── PROJECT_FOUNDATION.md      ← this file
+├── case_toninato.json         ← standardized case input (Toninato reference)
+├── bess_engine.py             ← core simulation engine (physics + economics)
+├── profile_builder.py         ← synthetic load profile: kWh/anno → 35,040 slots
+├── pvgis.py                   ← PVGIS API client (PV production hourly)
+├── simulatore.py              ← Streamlit UI (orchestrates all modules)
+└── requirements.txt           ← Python dependencies
 ```
 
----
+### Module responsibilities
 
-## 4. Il case file standardizzato
-
-`cases/example_case.json` è il contratto dati del sistema.
-Contiene:
-
-```json
-{
-  "site": {
-    "name": "Industria Esempio S.r.l.",
-    "location": { "lat": 45.5, "lon": 11.5 },
-    "consumo_annuo_kwh": 350000,
-    "picco_richiesto_kw": 150,
-    "tariffa_energia_eur_kwh": 0.20,
-    "quota_potenza_eur_kw_mese": 12.0
-  },
-  "pv": {
-    "presente": true,
-    "kwp": 80,
-    "source": "pvgis"
-  },
-  "bess": {
-    "capacita_nominale_kwh": 200,
-    "capacita_utile_kwh": 180,
-    "potenza_carica_kw": 100,
-    "potenza_scarica_kw": 100,
-    "soc_min": 0.05,
-    "soc_max": 0.95,
-    "efficienza_roundtrip": 0.90,
-    "costo_installato_eur_kwh": 255,
-    "anni_vita": 15
-  },
-  "economico": {
-    "tasso_sconto": 0.05,
-    "anni_analisi": 20,
-    "om_rate": 0.01,
-    "degradazione_annua": 0.02
-  }
-}
-```
-
-MVP inizia con **profilo sintetico** generato da `consumo_annuo_kwh` + `picco_richiesto_kw`.
-Fase 2 aggiunge: upload CSV reale del cliente.
-
----
-
-## 5. I 4 scenari
-
-| Scenario | Cosa simula |
+| File | Does |
 |---|---|
-| S1 | Baseline — no FV, no BESS |
-| S2 | Con FV attuale — autoconsumo diretto, no BESS |
-| S3 | BESS solo autoconsumo FV |
-| S4 | BESS multilayer: autoconsumo + peak shaving + energy shifting |
+| `case_toninato.json` | All case parameters in one place — site, BESS, tariff, PVGIS |
+| `bess_engine.py` | BESSConfig, SiteConfig, simulate_s3(), simulate_s4(), compute_kpi(), business_plan() |
+| `profile_builder.py` | Generates synthetic industrial load profile from annual kWh + peak kW |
+| `pvgis.py` | Calls PVGIS API, returns hourly PV production array for full year |
+| `simulatore.py` | Streamlit pages: input → run → seasonal charts → KPIs → business case |
 
 ---
 
-## 6. Output obbligatori
+## Prior materials inventory
 
-### Tecnici
-- Profili settimanali stagionali (4 stagioni × [carico, FV, carica, scarica, prelievo rete, SOC])
-- Throughput annuale batteria (kWh)
-- Cicli equivalenti annui
-- Effetto peak shaving (picco ridotto, kW)
-- Effetto autoconsumo (% FV autoconsumata)
-
-### Economici — sempre separati
-- Saving FV via BESS (€/anno)
-- Saving riduzione quota potenza (€/anno)
-- Margine energy shifting (€/anno)
-- Saving netto annuo
-- Payback semplice
-- NPV (tasso 5%, 20 anni)
-- IRR
-
----
-
-## 7. Ordine di costruzione (priorità MVP)
-
-1. **`cases/example_case.json`** — il contratto dati, tutto parte da qui
-2. **`engine/profile_builder.py`** — genera il profilo annuale 15-min da input semplici
-3. **`engine/bess_engine.py`** — simulazione slot per slot, S1-S4
-4. **`engine/economics.py`** — KPI economici e business plan
-5. **`run_simulation.py`** — CLI che collega tutto e scrive results.json
-6. **`dashboard.py`** — Streamlit che legge results.json e mostra tutto
-7. **`requirements.txt`** — dipendenze
-
----
-
-## 8. Cosa importare dal lavoro precedente
-
-| Componente | Origine | Usare? | Note |
-|---|---|---|---|
-| Costanti finanziarie | `simulatore.py` | Sì | EFFICIENCY=0.90, DISCOUNT_RATE=0.05, DEGRADATION=0.02 |
-| Logica NPV/IRR | `simulatore.py` | Sì | `numpy_financial` — funziona |
-| Grafico cash flow (Plotly) | `simulatore.py` | Sì | Struttura riusabile |
-| Formula sizing BESS | `simulatore.py` | No | Troppo grezza (`capacity = picco * 2`) |
-| dashboard.html | `bess-dashboard/` | No | Statico, abbandonato |
-| offerta.html | `bess-dashboard/` | No | Solo riferimento visivo |
-| 3 layer economici | Obsidian note 04 | Sì | Struttura corretta da mantenere |
-| SOC tracking con quota_fv | Obsidian note 04 | Sì | Importante per evitare doppio conteggio |
-| Peak shaving selettivo | Obsidian note 04 | Sì | Solo giorni critici (≥ 85% picco mensile) |
-| Carica notturna modulata | Obsidian note 04 | Sì | Solo inverno, solo 00-07 |
-| BESSConfig / SiteConfig | Obsidian note 04 | Sì | Struttura dati corretta |
-
----
-
-## 9. Fuori scope (MVP 0.1)
-
-- Import automatico da PDF bollette
-- Fetch PVGIS API (profilo FV da API esterna) — MVP usa stima semplice
-- Prezzi MGP orari per arbitraggio reale
-- Sizing optimizer automatico multi-taglia
-- SaaS / multiutente
-- Incentivi statali (Conto Energia, FER X, ecc.)
-- Report PDF esportabile
-
----
-
-## 10. Parametri tecnici BESS obbligatori
-
-Il motore deve sempre usare:
-- `capacita_nominale_kwh` e `capacita_utile_kwh` (non la stessa cosa)
-- `potenza_carica_kw` e `potenza_scarica_kw`
-- `soc_min`, `soc_max` (limiti operativi reali)
-- `efficienza_roundtrip` applicata sia in carica che in scarica (√η per ognuno)
-- `cicli_equivalenti` calcolati dall'output della simulazione
-
----
-
-## 11. Tecnologie
-
-| Tool | Uso |
+| Material | Decision |
 |---|---|
-| Python 3.11+ | tutto il backend |
-| numpy | profili e calcoli vettoriali |
-| numpy_financial | NPV, IRR |
-| Streamlit | dashboard |
-| Plotly | grafici |
+| Obsidian BESS-04 (engine blueprint) | **Import** — full logic blueprint for bess_engine.py |
+| Obsidian BESS-02 (validation numbers) | **Import** — S3/S4 targets, payback, CAPEX |
+| Obsidian BESS-06 (roadmap) | **Reference** — deadlines and phase scope |
+| `bess-dashboard/simulatore.py` | **Import UI structure only** — form layout, Plotly pattern |
+| `bess-dashboard/requirements.txt` | **Import** — copy as starting point |
+| `dashboard.html` | **Discard** — aesthetic reference only |
+| `offerta.html` | **Discard** — aesthetic reference only |
+| `hello.py` | **Discard** — first Python test, not relevant |
 
 ---
 
-## 12. Come avviare il programma (quando sarà pronto)
-
-```bash
-# 1. Crea/modifica il case file
-nano cases/example_case.json
-
-# 2. Gira la simulazione
-python run_simulation.py cases/example_case.json
-
-# 3. Apri la dashboard
-streamlit run dashboard.py
-```
+*Last updated: 2026-05-05 — foundation document, pre-implementation*

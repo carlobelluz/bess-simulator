@@ -187,6 +187,7 @@ def _section_economics(econ, case) -> None:
     # Left — savings breakdown by layer
     with col_l:
         st.markdown("**Risparmio annuo per layer  (S3 vs S4)**")
+        st.caption("I tre layer derivano da un'unica simulazione con una specifica strategia di dispatch — non sono valori indipendenti. Modificare la strategia redistribuisce il risparmio tra i layer.")
         scenarios = [sc for sc in ["S3", "S4"] if "saving_fv_eur" in econ.get(sc, {})]
         if scenarios:
             fig_bar = go.Figure()
@@ -212,6 +213,7 @@ def _section_economics(econ, case) -> None:
         st.markdown("**Flussi di cassa cumulativi**")
         anni  = case["simulation"]["anni_analisi"]
         years = list(range(anni + 1))
+
         fig_cf = go.Figure()
         cf_colors = {"S3": "#1565C0", "S4": "#2E7D32"}
         for sc in ["S3", "S4"]:
@@ -234,6 +236,15 @@ def _section_economics(econ, case) -> None:
             hovermode="x unified",
         )
         st.plotly_chart(fig_cf, use_container_width=True)
+        _repl_yr = next(
+            (econ[sc].get("battery_replacement_year")
+             for sc in ["S3", "S4"] if sc in econ and econ[sc].get("battery_replacement_year")),
+            None,
+        )
+        if _repl_yr:
+            st.caption(f"Sostituzione batteria inclusa all'anno {_repl_yr}.")
+        else:
+            st.caption("Sostituzione batteria non inclusa nei flussi di cassa. Rigenerare i risultati.")
 
     # Detail expanders for S3 and S4
     for sc in ["S3", "S4"]:
@@ -245,6 +256,10 @@ def _section_economics(econ, case) -> None:
             c1, c2, c3 = st.columns(3)
             c1.metric("Investimento",     f"{e['investment_eur']:,.0f} €")
             c1.metric("O&M annuo",        f"{e['om_annual_eur']:,.0f} €/yr")
+            repl_yr = e.get("battery_replacement_year")
+            if repl_yr:
+                c1.metric(f"Sostituzione (anno {repl_yr})",
+                          f"−{e.get('replacement_capex_eur', 0):,.0f} €")
             c2.metric("Layer 1 (FV)",     f"{e['saving_fv_eur']:,.0f} €/yr")
             c2.metric("Layer 2 (picco)",  f"{e['saving_quota_eur']:,.0f} €/yr")
             c2.metric("Layer 3 (shift)",  f"{e['shifting_margin_eur']:,.0f} €/yr")
@@ -252,6 +267,12 @@ def _section_economics(econ, case) -> None:
             c3.metric("NPV",              f"{e['npv_eur']:,.0f} €")
             irr = e.get("irr_pct")
             c3.metric("IRR",              f"{irr} %" if irr is not None else "—")
+            fv_regime = case.get("pv", {}).get("fv_export_regime", "nessuno")
+            if fv_regime == "nessuno":
+                st.caption("Layer 1: assume valore export FV = 0 €/kWh (nessun regime incentivante). Se il cliente ha SSP o Ritiro Dedicato, il valore reale è inferiore.")
+            else:
+                st.caption(f"Layer 1: calcolato con costo opportunità export FV — regime: **{fv_regime}**.")
+            st.caption("Layer 2: assume fatturazione sul picco massimo mensile singolo. Non include penali per sforamento della potenza contrattuale.")
 
 
 # ── Loader ────────────────────────────────────────────────────────────────────
