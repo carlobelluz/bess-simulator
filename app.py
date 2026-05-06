@@ -28,6 +28,10 @@ from engine import build_all_profiles, simulate, compute_economics
 SLOT_H   = 0.25
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Italy bounding box for geocoding validation
+_IT_LAT = (36.0, 47.5)
+_IT_LON = (6.0,  18.5)
+
 _SEASON_DAYS = {
     "Inverno (gennaio)":   21,
     "Primavera (aprile)": 105,
@@ -327,13 +331,20 @@ def _page_input() -> None:
         st.warning("Inserisci il nome del cliente.")
         st.stop()
 
-    # Geocode location → lat/lon
+    # Geocode location → lat/lon (validated against Italy bounding box)
     lat, lon = None, None
     if location.strip():
         with st.spinner(f"Geocoding '{location}'..."):
             coords = _geocode(location.strip())
         if coords:
-            lat, lon = coords
+            lat_c, lon_c = coords
+            if _IT_LAT[0] <= lat_c <= _IT_LAT[1] and _IT_LON[0] <= lon_c <= _IT_LON[1]:
+                lat, lon = lat_c, lon_c
+            else:
+                st.warning(
+                    f"Le coordinate trovate per '{location}' ({lat_c:.2f}°N, {lon_c:.2f}°E) "
+                    "sono fuori dall'Italia. Verrà usato un profilo FV sintetico al posto di PVGIS."
+                )
         else:
             st.warning(
                 f"Posizione '{location}' non trovata. "

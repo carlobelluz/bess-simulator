@@ -176,89 +176,120 @@ def _run_s3(load_kw: np.ndarray, pv_kw: np.ndarray, bp: dict) -> dict:
 def _run_s4(
     load_kw: np.ndarray,
     pv_kw:   np.ndarray,
-    price:   np.ndarray,
+    price:   np.ndarray,   # kept for API compatibility; unused (Layer 3 disabled)
     month:   np.ndarray,
     s2_grid: np.ndarray,
     soglia:  float,
     bp:      dict,
 ) -> dict:
     """
-    S4: BESS multilayer — self-consumption + peak shaving + shifting.
+    S4: BESS multilayer — self-consumption + peak shaving.
+    Grid charging (Layer 3 shifting/arbitrage) is disabled in MVP; Layer 3 = 0.
 
-    ── Pre-computation ──────────────────────────────────────────────────────────
-    Monthly peak reference: max daily import peak (S2 grid, clipped to ≥0) per month.
-    Critical day : daily peak ≥ soglia × monthly_peak.
-    Shaving target: soglia × monthly_peak — the draw level we aim to stay below.
+    ── Peak shaving: look-ahead dispatch ────────────────────────────────────────
+    At the start of each critical day, pre-compute optimal dispatch:
+    1. Identify peak window: slots where net_load > P_target.
+    2. Compute DC energy needed to shave the full window.
+    3. If available SOC is insufficient, binary-search for the best achievable
+       P_target* (keeps more energy budget, raises the target).
+    4. Build p_d_plan[96] — slot-by-slot planned AC discharge for the day.
+    5. Track day_soc_res_dc: remaining DC kWh reserved for future peak slots
+       in the same day. Decremented after each peak slot is executed.
 
-    ── Dispatch on CRITICAL days (peak shaving priority) ────────────────────────
-    - Charge from PV surplus normally.
-    - Discharge ONLY when net > shaving_target:
-        remove just enough SOC to bring grid draw down to the target.
-    - When 0 ≤ net ≤ shaving_target: battery holds back (no action).
-    - No grid charging on critical days.
+    ── SOC reservation on critical days ─────────────────────────────────────────
+    SC discharge is only allowed when:
+        soc - soc_min - day_soc_res_dc > 0
+    This makes the peak-shaving reservation inviolable: any SC discharge
+    is taken from the SOC above the reservation floor.
 
-    ── Dispatch on NON-CRITICAL days (self-consumption + shifting) ──────────────
-    - S3-style: charge from PV surplus, discharge to cover load deficit.
-    - [PROVISIONAL — v1] Grid charging for arbitrage:
-        triggered when no charge/discharge is already active
-        AND price[t] < daily mean price
-        AND soc < 80 % of soc_max.
-        Rationale: buy cheap electricity, sell back later as avoided peak import.
-        This rule is intentionally naive; it will be replaced in v2 with a
-        look-ahead or optimization-based charging schedule.
-
-    ── SOC source tracking ──────────────────────────────────────────────────────
-    Same FV/grid proportion tracking as S3.
-    Grid-charged energy does NOT increment soc_fv.
+    ── Non-critical days ─────────────────────────────────────────────────────────
+    Pure S3-style self-consumption. No grid charging on any day.
     """
     eta_c, eta_d     = bp["eta_c"], bp["eta_d"]
     soc_min, soc_max = bp["soc_min_kwh"], bp["soc_max_kwh"]
     p_c_max, p_d_max = bp["p_c_max"], bp["p_d_max"]
 
-    n_days = N_SLOTS // 96
+    n_days   = N_SLOTS // 96
+    net_load = load_kw - pv_kw   # signed: >0 import deficit, <0 PV surplus
 
-    # Daily import peak from S2 (reference without BESS, clip exports to 0)
-    daily_peak_s2 = (s2_grid.clip(min=0)
-                     .reshape(n_days, 96)
-                     .max(axis=1))                  # (365,) kW
-
-    day_month = month[::96][:n_days]                # (365,) values 1-12
-
-    # Monthly peak = max of all daily import peaks in that month (1-indexed)
+    # Monthly reference peak (S2 import, no BESS)
+    daily_peak_s2 = s2_grid.clip(min=0).reshape(n_days, 96).max(axis=1)
+    day_month     = month[::96][:n_days]
     monthly_peak_s2 = np.zeros(13)
     for m in range(1, 13):
         mask = day_month == m
         if mask.any():
             monthly_peak_s2[m] = daily_peak_s2[mask].max()
 
-    # Per-day shaving target and critical flag (vectorised)
-    shaving_target = soglia * monthly_peak_s2[day_month]   # (365,) kW
-    critical_day   = daily_peak_s2 >= shaving_target        # (365,) bool
+    shaving_target = soglia * monthly_peak_s2[day_month]   # (n_days,) kW
+    critical_day   = daily_peak_s2 >= shaving_target        # (n_days,) bool
 
-    # Daily mean price used by the provisional grid-charging rule
-    daily_mean_price = price.reshape(n_days, 96).mean(axis=1)   # (365,)
-
-    # ── Slot loop ─────────────────────────────────────────────────────────────
+    # Output arrays
     grid_kw             = np.empty(N_SLOTS)
     bess_charge_kw      = np.zeros(N_SLOTS)
     bess_discharge_kw   = np.zeros(N_SLOTS)
     soc_arr             = np.empty(N_SLOTS)
     discharged_fv_kwh   = np.zeros(N_SLOTS)
     discharged_grid_kwh = np.zeros(N_SLOTS)
-    charged_grid_kwh    = np.zeros(N_SLOTS)
+    charged_grid_kwh    = np.zeros(N_SLOTS)   # always 0 — no grid charging
     charged_fv_ac_kwh   = np.zeros(N_SLOTS)
 
     soc    = soc_min
     soc_fv = 0.0
 
+    # Day-level look-ahead state (reset at t_in_day == 0)
+    day_p_d_plan      = np.zeros(96)   # planned AC discharge per slot (kW)
+    day_p_target_star = 0.0            # achievable P_target for today
+    day_soc_res_dc    = 0.0            # remaining DC kWh reserved for peak slots
+    day_is_critical   = False
+
     for t in range(N_SLOTS):
-        d   = t // 96
-        net = load_kw[t] - pv_kw[t]   # >0 deficit, <0 surplus
+        d        = t // 96
+        t_in_day = t % 96
+        net      = net_load[t]
         p_c = p_d = 0.0
 
-        if critical_day[d]:
-            # ── Peak shaving priority: hold SOC for high-demand moments ──────
-            if net < 0:                              # PV surplus — top up battery
+        # ── Plan the current day at its first slot ──────────────────────────
+        if t_in_day == 0:
+            day_is_critical = bool(critical_day[d])
+            if day_is_critical:
+                day_net  = net_load[d * 96 : d * 96 + 96]
+                p_target = float(shaving_target[d])
+
+                # DC kWh needed to shave all peak slots to p_target
+                e_needed_dc = float(
+                    np.maximum(0.0, day_net - p_target).sum() * SLOT_H / eta_d)
+                soc_usable  = soc - soc_min
+
+                if e_needed_dc <= soc_usable:
+                    p_target_star = p_target
+                else:
+                    # Binary search: find lowest achievable target given soc_usable
+                    lo = p_target
+                    hi = float(max(day_net.max(), p_target * 1.001))
+                    for _ in range(20):
+                        mid   = (lo + hi) * 0.5
+                        e_mid = float(
+                            np.maximum(0.0, day_net - mid).sum() * SLOT_H / eta_d)
+                        if e_mid <= soc_usable:
+                            hi = mid   # can do better (lower target)
+                        else:
+                            lo = mid   # too aggressive
+                    p_target_star = hi
+
+                day_p_d_plan   = np.minimum(
+                    np.maximum(0.0, day_net - p_target_star), p_d_max)
+                day_soc_res_dc = float(day_p_d_plan.sum() * SLOT_H / eta_d)
+                day_p_target_star = p_target_star
+            else:
+                day_p_d_plan      = np.zeros(96)
+                day_soc_res_dc    = 0.0
+                day_p_target_star = 0.0
+
+        # ── Slot dispatch ───────────────────────────────────────────────────
+        if day_is_critical:
+
+            if net < 0:   # PV surplus → charge (always allowed)
                 surplus = -net
                 p_c     = min(surplus, p_c_max,
                               (soc_max - soc) / (eta_c * SLOT_H))
@@ -268,11 +299,11 @@ def _run_s4(
                 soc_fv += e_in
                 charged_fv_ac_kwh[t] = p_c * SLOT_H
 
-            elif net > shaving_target[d]:            # grid draw exceeds target
-                excess    = net - shaving_target[d]
-                p_d_avail = (soc - soc_min) * eta_d / SLOT_H
-                p_d       = min(excess, p_d_max, p_d_avail)
-                p_d       = max(p_d, 0.0)
+            elif net > day_p_target_star:   # peak window: execute planned discharge
+                p_d = min(day_p_d_plan[t_in_day],
+                          (soc - soc_min) * eta_d / SLOT_H,
+                          p_d_max)
+                p_d = max(p_d, 0.0)
                 if p_d > 0:
                     e_dc       = p_d / eta_d * SLOT_H
                     fv_ratio   = soc_fv / soc if soc > 0 else 0.0
@@ -280,11 +311,25 @@ def _run_s4(
                     discharged_grid_kwh[t] = e_dc * (1.0 - fv_ratio)
                     soc    -= e_dc
                     soc_fv  = max(soc_fv - discharged_fv_kwh[t], 0.0)
-            # 0 ≤ net ≤ shaving_target: battery holds back, no action
+                # Decrement reservation by planned slot energy (regardless of actual)
+                day_soc_res_dc = max(
+                    0.0, day_soc_res_dc - day_p_d_plan[t_in_day] * SLOT_H / eta_d)
 
-        else:
-            # ── Non-critical day: self-consumption ───────────────────────────
-            if net < 0:                              # PV surplus → charge
+            elif net > 0:   # 0 < net ≤ p_target_star: SC if above reservation
+                soc_above = soc - soc_min - day_soc_res_dc
+                if soc_above > 0:
+                    p_d = min(net, p_d_max, soc_above * eta_d / SLOT_H)
+                    p_d = max(p_d, 0.0)
+                    if p_d > 0:
+                        e_dc       = p_d / eta_d * SLOT_H
+                        fv_ratio   = soc_fv / soc if soc > 0 else 0.0
+                        discharged_fv_kwh[t]   = e_dc * fv_ratio
+                        discharged_grid_kwh[t] = e_dc * (1.0 - fv_ratio)
+                        soc    -= e_dc
+                        soc_fv  = max(soc_fv - discharged_fv_kwh[t], 0.0)
+
+        else:   # non-critical day: S3-style SC, no grid charging
+            if net < 0:   # PV surplus → charge
                 surplus = -net
                 p_c     = min(surplus, p_c_max,
                               (soc_max - soc) / (eta_c * SLOT_H))
@@ -294,7 +339,7 @@ def _run_s4(
                 soc_fv += e_in
                 charged_fv_ac_kwh[t] = p_c * SLOT_H
 
-            elif net > 0:                            # load deficit → discharge
+            elif net > 0:   # load deficit → discharge for SC
                 p_d_avail = (soc - soc_min) * eta_d / SLOT_H
                 p_d       = min(net, p_d_max, p_d_avail)
                 p_d       = max(p_d, 0.0)
@@ -305,18 +350,6 @@ def _run_s4(
                     discharged_grid_kwh[t] = e_dc * (1.0 - fv_ratio)
                     soc    -= e_dc
                     soc_fv  = max(soc_fv - discharged_fv_kwh[t], 0.0)
-
-            # [PROVISIONAL — v1] Grid charging for shifting arbitrage.
-            # Will be replaced with a look-ahead or optimised rule in v2.
-            if (p_c == 0 and p_d == 0
-                    and price[t] < daily_mean_price[d]
-                    and soc < 0.8 * soc_max):
-                p_c  = min(p_c_max, (soc_max - soc) / (eta_c * SLOT_H))
-                p_c  = max(p_c, 0.0)
-                e_in = p_c * eta_c * SLOT_H
-                soc += e_in
-                # Grid-charged energy does NOT increment soc_fv
-                charged_grid_kwh[t] = p_c * SLOT_H   # AC kWh drawn from grid
 
         bess_charge_kw[t]    = p_c
         bess_discharge_kw[t] = p_d

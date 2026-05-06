@@ -47,16 +47,24 @@ def compute_economics(case: dict, profiles: dict, results: dict) -> dict:
     cap_nom         = bess["capacita_nominale_kwh"]
     eta_d           = np.sqrt(bess["efficienza_roundtrip"])
 
+    load_kw        = np.asarray(profiles["load_kw"])
+    pv_kw          = np.asarray(profiles["pv_kw"])
+    load_total_kwh = float(load_kw.sum() * SLOT_H)
+    pv_total_kwh   = float(pv_kw.sum() * SLOT_H)
+    direct_sc_kwh  = float(np.minimum(load_kw, pv_kw).sum() * SLOT_H)
+
     out = {}
 
     # S1 and S2 — reference cost summaries
     if "S1" in results:
-        out["S1"] = _reference_kpis(results["S1"]["grid_kw"], price, month)
+        out["S1"] = _reference_kpis(results["S1"]["grid_kw"], price, month,
+                                    quota_kw_mese)
 
     s2_grid = None
     if "S2" in results:
         s2_grid = results["S2"]["grid_kw"]
-        out["S2"] = _reference_kpis(s2_grid, price, month)
+        out["S2"] = _reference_kpis(s2_grid, price, month, quota_kw_mese,
+                                    direct_sc_kwh, pv_total_kwh, load_total_kwh)
 
     # S3 and S4 — BESS economic analysis
     for sc in ["S3", "S4"]:
@@ -89,7 +97,8 @@ def compute_economics(case: dict, profiles: dict, results: dict) -> dict:
         # ── Layer 3: shifting margin — S4 only ───────────────────────────────
         # Revenue = avoided import when discharging grid-sourced energy
         # Cost    = grid energy purchased during cheap-price charging
-        if sc == "S4":
+        # Zeroed when no grid charging occurred (disabled in MVP)
+        if sc == "S4" and np.asarray(r_sc["charged_grid_kwh"]).sum() > 0:
             revenue_shifting = (r_sc["discharged_grid_kwh"] * eta_d * price).sum()
             cost_grid_charge = (r_sc["charged_grid_kwh"] * price).sum()
             shifting_margin  = revenue_shifting - cost_grid_charge
@@ -117,6 +126,22 @@ def compute_economics(case: dict, profiles: dict, results: dict) -> dict:
         if anni_vita <= anni:
             cash_flows[anni_vita] -= replacement_capex
 
+        # ── Self-consumption KPIs ─────────────────────────────────────────────
+        bess_sc_ac_kwh = float(np.asarray(r_sc["discharged_fv_kwh"]).sum()) * eta_d
+        total_sc_kwh   = direct_sc_kwh + bess_sc_ac_kwh
+        scr_pct        = total_sc_kwh / pv_total_kwh * 100 if pv_total_kwh > 0 else 0.0
+        ssr_pct        = total_sc_kwh / load_total_kwh * 100 if load_total_kwh > 0 else 0.0
+
+        # ── Demand charge under this scenario ────────────────────────────────
+        n_d    = N_SLOTS // 96
+        d_mon  = month[::96][:n_d]
+        d_pk   = np.asarray(grid_kw).clip(min=0).reshape(n_d, 96).max(axis=1)
+        annual_demand_charge = sum(
+            float(d_pk[d_mon == m].max()) * quota_kw_mese
+            if (d_mon == m).any() else 0.0
+            for m in range(1, 13)
+        )
+
         payback = _payback(cash_flows)
         npv_val = float(npf.npv(discount_rate, cash_flows))
         try:
@@ -131,6 +156,14 @@ def compute_economics(case: dict, profiles: dict, results: dict) -> dict:
             "saving_quota_eur":    round(saving_quota, 2),
             "shifting_margin_eur": round(shifting_margin, 2),
             "annual_saving_eur":   round(annual_saving, 2),
+            # Self-consumption KPIs
+            "direct_selfcons_kwh": round(direct_sc_kwh, 1),
+            "bess_sc_kwh":         round(bess_sc_ac_kwh, 1),
+            "total_selfcons_kwh":  round(total_sc_kwh, 1),
+            "scr_pct":             round(scr_pct, 1),
+            "ssr_pct":             round(ssr_pct, 1),
+            # Demand charge
+            "annual_demand_charge_eur": round(annual_demand_charge, 2),
             # Battery KPIs
             "throughput_kwh":      round(throughput, 1),
             "equivalent_cycles":   round(eq_cycles, 1),
@@ -152,7 +185,15 @@ def compute_economics(case: dict, profiles: dict, results: dict) -> dict:
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _reference_kpis(grid_kw: np.ndarray, price: np.ndarray, month: np.ndarray) -> dict:
+def _reference_kpis(
+    grid_kw:        np.ndarray,
+    price:          np.ndarray,
+    month:          np.ndarray,
+    quota_kw_mese:  float = 0.0,
+    direct_sc_kwh:  float = 0.0,
+    pv_total_kwh:   float = 0.0,
+    load_total_kwh: float = 0.0,
+) -> dict:
     """Annual cost and peak summary for S1 / S2 (no BESS)."""
     n_days    = N_SLOTS // 96
     day_month = month[::96][:n_days]
@@ -168,11 +209,19 @@ def _reference_kpis(grid_kw: np.ndarray, price: np.ndarray, month: np.ndarray) -
         if mask.any():
             monthly_peak[m - 1] = day_peaks[mask].max()
 
+    annual_demand_charge = float(monthly_peak.sum()) * quota_kw_mese
+    scr = direct_sc_kwh / pv_total_kwh * 100 if pv_total_kwh > 0 else 0.0
+    ssr = direct_sc_kwh / load_total_kwh * 100 if load_total_kwh > 0 else 0.0
+
     return {
-        "annual_grid_import_kwh": round(import_kwh),
-        "annual_grid_export_kwh": round(export_kwh),
-        "annual_energy_cost_eur": round(energy_cost, 2),
-        "monthly_peak_kw":        [round(p, 1) for p in monthly_peak],
+        "annual_grid_import_kwh":   round(import_kwh),
+        "annual_grid_export_kwh":   round(export_kwh),
+        "annual_energy_cost_eur":   round(energy_cost, 2),
+        "annual_demand_charge_eur": round(annual_demand_charge, 2),
+        "monthly_peak_kw":          [round(p, 1) for p in monthly_peak],
+        "direct_selfcons_kwh":      round(direct_sc_kwh, 1),
+        "scr_pct":                  round(scr, 1),
+        "ssr_pct":                  round(ssr, 1),
     }
 
 
