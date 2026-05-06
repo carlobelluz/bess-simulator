@@ -126,6 +126,14 @@ def compute_economics(case: dict, profiles: dict, results: dict) -> dict:
         if anni_vita <= anni:
             cash_flows[anni_vita] -= replacement_capex
 
+        # ── Optimal sizing KPI (Layer 1) ─────────────────────────────────────
+        n_d_sz        = N_SLOTS // 96
+        surplus_daily = (np.maximum(0.0, pv_kw - load_kw)
+                         .reshape(n_d_sz, 96).sum(axis=1) * SLOT_H)
+        surplus_pos   = surplus_daily[surplus_daily > 0]
+        cap_l1_opt    = (round(float(np.median(surplus_pos)) * 1.15)
+                         if len(surplus_pos) > 0 else 0.0)
+
         # ── Self-consumption KPIs ─────────────────────────────────────────────
         bess_sc_ac_kwh = float(np.asarray(r_sc["discharged_fv_kwh"]).sum()) * eta_d
         total_sc_kwh   = direct_sc_kwh + bess_sc_ac_kwh
@@ -164,6 +172,8 @@ def compute_economics(case: dict, profiles: dict, results: dict) -> dict:
             "ssr_pct":             round(ssr_pct, 1),
             # Demand charge
             "annual_demand_charge_eur": round(annual_demand_charge, 2),
+            # Sizing KPI
+            "cap_l1_ottimale_kwh":      round(cap_l1_opt),
             # Battery KPIs
             "throughput_kwh":      round(throughput, 1),
             "equivalent_cycles":   round(eq_cycles, 1),
