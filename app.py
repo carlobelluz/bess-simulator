@@ -328,6 +328,191 @@ def _chart_scenario_ladder(econ: dict, ha_pv: bool) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
+# ── Advisory messages (Fix 3.3) ───────────────────────────────────────────────
+
+def _advisory_message(econ: dict, form: dict, ha_pv: bool) -> tuple[str, str] | None:
+    """
+    Returns (message_text, streamlit_kind) for the most relevant advisory.
+    kind: "info" | "warning" | "success" | "error"
+    First matching condition wins — order is intentional.
+    """
+    e4    = econ.get("S4", {})
+    e2    = econ.get("S2", {})
+    e_sfv = econ.get("S_FV", {})
+
+    npv           = e4.get("npv_eur", 0)
+    payback       = e4.get("payback_yr")
+    annual_saving = e4.get("annual_saving_eur", 0)
+    saving_fv     = e4.get("saving_fv_eur", 0)
+    saving_quota  = e4.get("saving_quota_eur", 0)
+    investment    = e4.get("investment_eur", 0)
+    scr_s4        = e4.get("scr_pct", 0)
+    scr_s2        = e2.get("scr_pct", 0)
+
+    # 1. No PV — recommend FV first
+    if not ha_pv:
+        sfv_npv = e_sfv.get("npv_eur", 0) if e_sfv else 0
+        sfv_pb  = e_sfv.get("payback_yr") if e_sfv else None
+        if sfv_npv > 0 and sfv_pb:
+            return (
+                f"**Prima di tutto, valuta un impianto FV.** "
+                f"Senza produzione solare la batteria ha poco surplus da valorizzare. "
+                f"Un FV da {e_sfv['kwp']} kWp ha NPV stimato **+{sfv_npv:,.0f} €** "
+                f"con payback di {sfv_pb} anni. "
+                f"Con FV + BESS insieme il rendimento complessivo migliorerà significativamente.",
+                "info",
+            )
+        return (
+            "**Attenzione: nessun impianto FV.** "
+            "Senza produzione solare la batteria non può valorizzare l'autoconsumo. "
+            "Il rendimento dipende quasi interamente dal peak shaving e dall'arbitraggio. "
+            "Considera di valutare prima un impianto fotovoltaico.",
+            "warning",
+        )
+
+    # 2. FV adds little — load mostly outside solar hours
+    if ha_pv and scr_s2 < 38 and saving_fv < 1_500:
+        return (
+            f"**Gran parte dei consumi avviene fuori dalle ore di produzione solare** "
+            f"(autoconsumo diretto FV: {scr_s2:.0f}%). "
+            f"In questo profilo la batteria è quasi indispensabile per valorizzare il FV — "
+            f"senza di essa gran parte dell'energia solare verrebbe ceduta a zero.",
+            "info",
+        )
+
+    # 3. SCR already high — battery adds little SC value
+    if ha_pv and scr_s2 > 75 and (scr_s4 - scr_s2) < 8:
+        return (
+            f"**L'autoconsumo FV senza batteria è già alto ({scr_s2:.0f}%).** "
+            f"La batteria porta l'autoconsumo al {scr_s4:.0f}% (+{scr_s4 - scr_s2:.0f} punti). "
+            f"Il vantaggio principale per questo sito è il **peak shaving**: "
+            f"{saving_quota:,.0f} €/anno di riduzione quota potenza.",
+            "info",
+        )
+
+    # 4. Peak shaving not effective
+    if saving_quota < 200 and annual_saving > 0:
+        return (
+            f"**Il peak shaving ha effetto limitato su questo sito** ({saving_quota:,.0f} €/anno). "
+            f"Il risparmio principale viene dall'autoconsumo FV ({saving_fv:,.0f} €/anno). "
+            f"Possibili cause: picchi di breve durata oppure batteria già impegnata "
+            f"nell'autoconsumo durante le ore di punta.",
+            "warning",
+        )
+
+    # 5. NPV negative — identify main obstacle
+    if npv < 0:
+        if saving_quota < 500:
+            obstacle = (
+                f"il peak shaving genera solo {saving_quota:,.0f} €/anno "
+                f"(quota potenza bassa o picchi difficili da tagliare)"
+            )
+        elif saving_fv < 1_500:
+            obstacle = f"il surplus FV valorizzato è contenuto ({saving_fv:,.0f} €/anno)"
+        else:
+            obstacle = (
+                f"il risparmio annuo ({annual_saving:,.0f} €/anno) "
+                f"non è sufficiente a coprire l'investimento"
+            )
+        price_note = ""
+        if saving_fv > 0 and investment > 0:
+            target_saving = investment / 15
+            price_factor  = max(1.0, (target_saving - saving_quota) / max(saving_fv, 1))
+            pct_needed    = int((price_factor - 1) * 100)
+            if pct_needed > 5:
+                price_note = (
+                    f" Se il prezzo dell'energia salisse del {pct_needed}%, "
+                    f"il payback scenderebbe a circa 15 anni."
+                )
+        pb_str = f"{payback} anni" if payback else "non raggiunto in 20 anni"
+        return (
+            f"**Con i dati inseriti, la batteria non si ripaga in 20 anni** "
+            f"(NPV: {npv:,.0f} €, payback: {pb_str}). "
+            f"L'ostacolo principale: {obstacle}.{price_note}",
+            "error",
+        )
+
+    # 6. Payback acceptable — positive message
+    if payback and payback <= 12:
+        layer_dom = "peak shaving" if saving_quota > saving_fv else "autoconsumo FV"
+        return (
+            f"**Progetto conveniente.** Payback di **{payback} anni**, "
+            f"generato principalmente dal {layer_dom}. "
+            f"NPV a 20 anni: **+{npv:,.0f} €**.",
+            "success",
+        )
+
+    return None
+
+
+# ── Sensitivity analysis (Fix 3.1) ────────────────────────────────────────────
+
+def _display_sensitivity(econ: dict, best_sc: str, case: dict) -> None:
+    """3-scenario sensitivity table: pessimistic / base / optimistic."""
+    import numpy_financial as npf_s
+    import pandas as pd
+
+    e = econ.get(best_sc, {})
+    if not e or e.get("annual_saving_eur", 0) <= 0:
+        st.caption("Dati insufficienti per la sensitività.")
+        return
+
+    saving_fv    = e.get("saving_fv_eur", 0)
+    saving_quota = e.get("saving_quota_eur", 0)
+    investment   = e.get("investment_eur", 0)
+    om_annual    = e.get("om_annual_eur", 0)
+    anni         = case["simulation"]["anni_analisi"]
+    disc         = case["simulation"]["tasso_sconto"]
+    degr         = case["simulation"]["degradazione_annua"]
+    anni_vita    = case["bess"].get("anni_vita", anni + 1)
+
+    def _build_cf(s_adj, i_adj):
+        cf   = np.empty(anni + 1)
+        cf[0] = -i_adj
+        repl  = i_adj if anni_vita <= anni else 0.0
+        for y in range(1, anni + 1):
+            exp   = y - 1 if (anni_vita > anni or y <= anni_vita) else y - anni_vita - 1
+            cf[y] = s_adj * (1.0 - degr) ** exp - om_annual
+        if anni_vita <= anni:
+            cf[anni_vita] -= repl
+        return cf
+
+    def _pb(cf):
+        cum = 0.0
+        for y, v in enumerate(cf):
+            cum += v
+            if cum >= 0 and y > 0:
+                return y
+        return None
+
+    rows = []
+    for label, pf, cf_f in [
+        ("Pessimistico (prezzo −20%, CAPEX +10%)", 0.80, 1.10),
+        ("Base",                                   1.00, 1.00),
+        ("Ottimistico (prezzo +20%, CAPEX −10%)",  1.20, 0.90),
+    ]:
+        s_adj = saving_fv * pf + saving_quota
+        i_adj = investment * cf_f
+        cf    = _build_cf(s_adj, i_adj)
+        pb    = _pb(cf)
+        npv_v = round(float(npf_s.npv(disc, cf)))
+        rows.append({
+            "Scenario":           label,
+            "Risparmio/anno (€)": f"{s_adj:,.0f}",
+            "Investimento (€)":   f"{i_adj:,.0f}",
+            "Payback (anni)":     str(pb) if pb else "> 20",
+            "NPV 20 anni (€)":    f"{npv_v:+,.0f}",
+        })
+
+    df = pd.DataFrame(rows).set_index("Scenario")
+    st.dataframe(df, use_container_width=True)
+    st.caption(
+        "Il Layer 1 (autoconsumo FV) scala con il prezzo energia. "
+        "Il Layer 2 (peak shaving) non scala con il prezzo — dipende dalla quota potenza. "
+        "Layer 3 (arbitraggio) = 0 in MVP."
+    )
+
+
 # ── Step 1 — Input form ───────────────────────────────────────────────────────
 
 def _page_input() -> None:
@@ -415,6 +600,23 @@ def _page_input() -> None:
             index=0,
         )
 
+        st.markdown("### 6 — Incentivi (opzionale)")
+        col_t1, col_t2 = st.columns(2)
+        with col_t1:
+            t5_enable = st.checkbox(
+                "Transizione 5.0 — credito d'imposta",
+                value=False,
+                help="Attiva per vedere il business case con il credito d'imposta (D.Lgs 19/2024). "
+                     "Riduce il CAPEX netto nell'anno 0.",
+            )
+        with col_t2:
+            t5_aliquota = st.number_input(
+                "Aliquota credito d'imposta (%)",
+                min_value=15, max_value=45, value=35, step=5,
+                disabled=not t5_enable,
+                help="Aliquota effettiva. Range tipico: 25–45% a seconda della fascia di risparmio energetico.",
+            )
+
         st.divider()
         submitted = st.form_submit_button("Analizza →", type="primary", use_container_width=True)
 
@@ -462,6 +664,8 @@ def _page_input() -> None:
         "goal":                     goal,
         "lat":                      lat,
         "lon":                      lon,
+        "t5_enable":                t5_enable,
+        "t5_aliquota_pct":          t5_aliquota if t5_enable else 0,
     }
 
     case = _build_case(form)
@@ -541,6 +745,13 @@ def _page_results() -> None:
     c4.metric("NPV (20 anni)",   f"{e_best.get('npv_eur', 0):,.0f} €")
     irr = e_best.get("irr_pct")
     c5.metric("IRR",             f"{irr} %" if irr is not None else "—")
+
+    # ── Advisory message (Fix 3.3) ────────────────────────────────────────────
+    advisory = _advisory_message(econ, form, ha_pv)
+    if advisory:
+        msg_text, msg_kind = advisory
+        {"info": st.info, "warning": st.warning,
+         "success": st.success, "error": st.error}[msg_kind](msg_text)
 
     # ── S_FV: proposta impianto FV (Fix 2.1) ─────────────────────────────────
     e_sfv = econ.get("S_FV")
@@ -631,7 +842,8 @@ def _page_results() -> None:
 
     # ── Business case detail — tabs ────────────────────────────────────────────
     st.markdown("#### Business case di dettaglio")
-    tab1, tab2, tab3 = st.tabs(["Risparmio per layer", "Flussi di cassa", "Vista tecnica"])
+    tab_labels = ["Risparmio per layer", "Flussi di cassa", "Vista tecnica", "Sensitività & Incentivi"]
+    tab1, tab2, tab3, tab4 = st.tabs(tab_labels)
 
     with tab1:
         _chart_layers(econ)
@@ -650,11 +862,20 @@ def _page_results() -> None:
             d2.metric("S4 risparmio", f"{e4.get('annual_saving_eur', 0):,.0f} €/anno")
             d3.metric("S3 NPV",       f"{e3.get('npv_eur', 0):,.0f} €")
             d4.metric("S4 NPV",       f"{e4.get('npv_eur', 0):,.0f} €")
+            cap_l1 = e4.get("cap_l1_ottimale_kwh", 0)
+            cap_sim = case["bess"].get("capacita_nominale_kwh", 215)
+            sizing_note = ""
+            if cap_l1 > 0 and cap_sim > cap_l1 * 1.30:
+                sizing_note = (
+                    f" | ⚠️ Taglia ottimale per autoconsumo stimata: ~{cap_l1} kWh — "
+                    f"la G-MAX {cap_sim} kWh è {round(cap_sim/cap_l1*100-100)}% più grande."
+                )
             st.caption(
                 "S3 = solo autoconsumo FV.  "
                 "S4 = multilayer (autoconsumo + peak shaving + shifting).  "
                 f"Scenario primario mostrato sopra: **{best_sc}** "
                 f"(scelto in base all'obiettivo: «{form['goal']}»)."
+                + sizing_note
             )
 
     with tab2:
@@ -673,6 +894,57 @@ def _page_results() -> None:
             f"Vista tecnica settimanale — Scenario {best_sc}.  "
             "Carico, FV, potenza batteria e stato di carica (SOC) slot per slot."
         )
+
+    with tab4:
+        # ── Sensitivity analysis (Fix 3.1) ────────────────────────────────────
+        st.markdown("##### Sensitività prezzi e CAPEX")
+        _display_sensitivity(econ, best_sc, case)
+
+        # ── Transizione 5.0 (Fix 3.4) ─────────────────────────────────────────
+        t5_on      = form.get("t5_enable", False)
+        t5_aliq    = form.get("t5_aliquota_pct", 0)
+        if t5_on and t5_aliq > 0:
+            st.markdown("---")
+            st.markdown(f"##### Con Transizione 5.0 — credito d'imposta {t5_aliq}%")
+            st.warning(
+                "⚠️ Questo calcolo assume la qualificazione per il credito d'imposta Transizione 5.0 "
+                "(D.Lgs 19/2024). **Verifica obbligatoria con un professionista abilitato.** "
+                "L'aliquota effettiva dipende dalla fascia di risparmio energetico certificato.",
+                icon="⚠️",
+            )
+            net_invest  = invest * (1.0 - t5_aliq / 100.0)
+            base_cf     = list(e_best.get("cashflows", []))
+            if base_cf:
+                t5_cf    = base_cf.copy()
+                t5_cf[0] = -net_invest
+                # T5.0 applied to initial CAPEX only — replacement at year 15 stays at cost price
+
+                import numpy_financial as _npf_t5
+                t5_npv = round(float(_npf_t5.npv(case["simulation"]["tasso_sconto"], t5_cf)))
+                # Simple payback on reduced CAPEX
+                t5_pb = None
+                cum = 0.0
+                for yi, v in enumerate(t5_cf):
+                    cum += v
+                    if cum >= 0 and yi > 0:
+                        t5_pb = yi
+                        break
+                try:
+                    t5_irr_raw = _npf_t5.irr(t5_cf)
+                    t5_irr = round(float(t5_irr_raw) * 100, 2) if float(t5_irr_raw) == t5_irr_raw else None
+                except Exception:
+                    t5_irr = None
+
+                tc1, tc2, tc3, tc4 = st.columns(4)
+                tc1.metric("Investimento netto",  f"{net_invest:,.0f} €",
+                           f"−{invest - net_invest:,.0f} € di credito")
+                tc2.metric("Risparmio annuo",      f"{e_best.get('annual_saving_eur', 0):,.0f} €/anno")
+                tc3.metric("Payback (con T5.0)",   f"{t5_pb} anni" if t5_pb else "— anni")
+                tc4.metric("NPV 20 anni (T5.0)",   f"{t5_npv:+,.0f} €")
+                st.caption(
+                    f"Il credito d'imposta riduce il CAPEX dell'anno 0 da {invest:,.0f} € "
+                    f"a {net_invest:,.0f} €. I risparmi annui rimangono invariati."
+                )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
