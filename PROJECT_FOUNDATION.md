@@ -92,7 +92,7 @@ Power distributed evenly across the window to avoid creating artificial peaks.
 
 ---
 
-## Validation case: Toninato
+## Validation case: Cliente Esempio
 
 This is the reference case used to verify the engine is correct.
 
@@ -103,9 +103,9 @@ This is the reference case used to verify the engine is correct.
 | Investment (approx) | ~55,000 € |
 | Simple payback | ~7.8 anni |
 
-If the engine produces these numbers on the Toninato case, it is validated.
+If the engine produces these numbers on the Cliente Esempio case, it is validated.
 
-**Open item:** exact input parameters for Toninato (kWh/anno, kW peak, kWp PV, €/kWh, €/kW/month) — to be confirmed by Carlo before running validation.
+**Open item:** exact input parameters for Cliente Esempio (kWh/anno, kW peak, kWp PV, €/kWh, €/kW/month) — to be confirmed by Carlo before running validation.
 
 ---
 
@@ -115,7 +115,7 @@ If the engine produces these numbers on the Toninato case, it is validated.
 bess 0.1/
 ├── CLAUDE.md                  ← operating brief for Claude in this project
 ├── PROJECT_FOUNDATION.md      ← this file
-├── case_toninato.json         ← standardized case input (Toninato reference)
+├── example_case.json         ← standardized case input (Cliente Esempio reference)
 ├── bess_engine.py             ← core simulation engine (physics + economics)
 ├── profile_builder.py         ← synthetic load profile: kWh/anno → 35,040 slots
 ├── pvgis.py                   ← PVGIS API client (PV production hourly)
@@ -127,7 +127,7 @@ bess 0.1/
 
 | File | Does |
 |---|---|
-| `case_toninato.json` | All case parameters in one place — site, BESS, tariff, PVGIS |
+| `example_case.json` | All case parameters in one place — site, BESS, tariff, PVGIS |
 | `bess_engine.py` | BESSConfig, SiteConfig, simulate_s3(), simulate_s4(), compute_kpi(), business_plan() |
 | `profile_builder.py` | Generates synthetic industrial load profile from annual kWh + peak kW |
 | `pvgis.py` | Calls PVGIS API, returns hourly PV production array for full year |

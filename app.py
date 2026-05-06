@@ -537,7 +537,7 @@ def _page_input() -> None:
         st.markdown("### 1 — Sito e consumi")
         col1, col2 = st.columns(2)
         with col1:
-            nome_cliente = st.text_input("Nome cliente / azienda", placeholder="Es: Toninato S.r.l.")
+            nome_cliente = st.text_input("Nome cliente / azienda", placeholder="Es: Acciaierie Nord S.r.l.")
             location     = st.text_input("Comune o indirizzo", placeholder="Es: Castelfranco Veneto, TV",
                                          help="Usato per stimare la produzione FV con PVGIS")
         with col2:

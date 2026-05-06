@@ -1,13 +1,13 @@
 {
   "_schema_version": "1.0",
-  "_note": "Example case: Toninato S.r.l. — industrial site with PV, candidate for BESS multilayer",
+  "_note": "Example case: industrial site with PV, candidate for BESS multilayer",
 
   "meta": {
-    "case_id": "toninato-001",
-    "nome_cliente": "Toninato S.r.l.",
-    "nome_sito": "Stabilimento di Castelfranco Veneto",
+    "case_id": "example-001",
+    "nome_cliente": "Cliente Esempio S.r.l.",
+    "nome_sito": "Stabilimento Nord Italia",
     "data_creazione": "2026-05-05",
-    "autore": "Carlo Belluz"
+    "autore": "BESS Decision Tool"
   },
 
   "site": {
