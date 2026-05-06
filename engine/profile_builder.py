@@ -53,7 +53,7 @@ def build_all_profiles(case: dict, base_dir: str = ".") -> dict:
       n_slots       int            — 35040
     """
     ti = _make_time_index()
-    return {
+    out = {
         "load_kw":       build_load_profile(case["site"], ti),
         "pv_kw":         build_pv_profile(case["pv"], ti, case.get("site"), base_dir),
         "price_eur_kwh": build_price_profile(case["tariffs"], base_dir, ti),
@@ -61,6 +61,11 @@ def build_all_profiles(case: dict, base_dir: str = ".") -> dict:
         "n_slots":       N_SLOTS,
         **ti,
     }
+    # Proposed FV (S_FV scenario): build separate profile if pv_proposto section exists
+    if "pv_proposto" in case:
+        out["pv_kw_proposto"] = build_pv_profile(
+            case["pv_proposto"], ti, case.get("site"), base_dir)
+    return out
 
 
 def build_load_profile(site: dict, ti: dict | None = None) -> np.ndarray:

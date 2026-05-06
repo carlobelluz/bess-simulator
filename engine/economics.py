@@ -180,6 +180,11 @@ def compute_economics(case: dict, profiles: dict, results: dict) -> dict:
             "replacement_capex_eur":    round(replacement_capex, 2),
         }
 
+    # S_FV: proposed FV investment for clients without existing PV
+    sfv = _compute_sfv_economics(case, profiles)
+    if sfv:
+        out["S_FV"] = sfv
+
     return out
 
 
@@ -266,6 +271,71 @@ def _payback(cash_flows: np.ndarray) -> float | None:
                 return round(y - 1 + frac, 2)
             return float(y)
     return None
+
+
+def _compute_sfv_economics(case: dict, profiles: dict) -> dict | None:
+    """
+    Economics for a proposed FV investment (S_FV scenario).
+
+    Used when the client has no existing PV and wants to evaluate adding one.
+    Requires case["pv_proposto"] and profiles["pv_kw_proposto"].
+
+    Saving = slot-by-slot min(load, pv) × SLOT_H × price
+    (direct self-consumption only; export is treated as zero value).
+    """
+    pv_prop = case.get("pv_proposto")
+    if not pv_prop or "pv_kw_proposto" not in profiles:
+        return None
+
+    pv_kw   = np.asarray(profiles["pv_kw_proposto"])
+    load_kw = np.asarray(profiles["load_kw"])
+    price   = np.asarray(profiles["price_eur_kwh"])
+
+    kwp          = pv_prop["kwp"]
+    costo_kwp    = pv_prop.get("costo_eur_kwp", 800)
+    anni         = pv_prop.get("anni_vita", 25)
+    degradazione = pv_prop.get("degradazione_annua", 0.005)
+    discount_rate = case.get("simulation", {}).get("tasso_sconto", 0.05)
+
+    # Year-1 saving = price avoided by directly consuming FV output
+    sc_kw      = np.minimum(load_kw, pv_kw)
+    saving_y1  = float((sc_kw * SLOT_H * price).sum())
+    direct_sc  = float(sc_kw.sum() * SLOT_H)
+    pv_total   = float(pv_kw.sum() * SLOT_H)
+    load_total = float(load_kw.sum() * SLOT_H)
+
+    investment = kwp * costo_kwp
+
+    cash_flows    = np.empty(anni + 1)
+    cash_flows[0] = -investment
+    for y in range(1, anni + 1):
+        cash_flows[y] = saving_y1 * (1.0 - degradazione) ** (y - 1)
+
+    payback  = _payback(cash_flows)
+    npv_val  = float(npf.npv(discount_rate, cash_flows))
+    try:
+        irr_raw = npf.irr(cash_flows)
+        irr_val = round(float(irr_raw) * 100.0, 2) if np.isfinite(irr_raw) else None
+    except Exception:
+        irr_val = None
+
+    scr = direct_sc / pv_total   * 100 if pv_total   > 0 else 0.0
+    ssr = direct_sc / load_total * 100 if load_total > 0 else 0.0
+
+    return {
+        "kwp":                 kwp,
+        "investment_eur":      round(investment, 2),
+        "costo_eur_kwp":       costo_kwp,
+        "saving_y1_eur":       round(saving_y1, 2),
+        "pv_total_kwh":        round(pv_total, 1),
+        "direct_selfcons_kwh": round(direct_sc, 1),
+        "scr_pct":             round(scr, 1),
+        "ssr_pct":             round(ssr, 1),
+        "payback_yr":          payback,
+        "npv_eur":             round(npv_val, 2),
+        "irr_pct":             irr_val,
+        "cashflows":           cash_flows.tolist(),
+    }
 
 
 def _get_export_value(pv: dict, price: np.ndarray) -> float | np.ndarray:

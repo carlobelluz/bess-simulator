@@ -81,40 +81,41 @@ def _build_case(form: dict) -> dict:
     ha_pv      = form["ha_pv"] and form["kwp"] > 0
     lat        = form.get("lat") or 45.5
     lon        = form.get("lon") or 10.0
-    pv_source  = "pvgis" if (ha_pv and form.get("lat") is not None) else "sintetico"
+    has_lat    = form.get("lat") is not None
+    pv_source  = "pvgis" if (ha_pv and has_lat) else "sintetico"
     cliente_id = form["nome_cliente"].lower().replace(" ", "-")[:20] or "cliente"
 
     case = {
         "meta": {
-            "case_id":       f"app-{cliente_id}",
-            "nome_cliente":  form["nome_cliente"] or "Cliente",
-            "nome_sito":     form["location"] or "Sito",
-            "data_creazione": "2026-05-05",
-            "autore":        "app",
+            "case_id":        f"app-{cliente_id}",
+            "nome_cliente":   form["nome_cliente"] or "Cliente",
+            "nome_sito":      form["location"] or "Sito",
+            "data_creazione": "2026-05-06",
+            "autore":         "app",
         },
         "site": {
-            "consumo_annuo_kwh":        form["consumo_annuo_kwh"],
-            "picco_potenza_kw":         form["picco_potenza_kw"],
-            "lat":                      lat,
-            "lon":                      lon,
-            "ore_lavoro_giorno":        form["ore_lavoro_giorno"],
-            "giorni_lavoro_settimana":  form["giorni_lavoro_settimana"],
+            "consumo_annuo_kwh":       form["consumo_annuo_kwh"],
+            "picco_potenza_kw":        form["picco_potenza_kw"],
+            "lat":                     lat,
+            "lon":                     lon,
+            "ore_lavoro_giorno":       form["ore_lavoro_giorno"],
+            "giorni_lavoro_settimana": form["giorni_lavoro_settimana"],
         },
         "pv": {
-            "presente":              ha_pv,
-            "kwp":                   form["kwp"] if ha_pv else 0,
-            "profilo_source":        pv_source,
-            "fv_export_regime":      "nessuno",
+            "presente":               ha_pv,
+            "kwp":                    form["kwp"] if ha_pv else 0,
+            "profilo_source":         pv_source,
+            "fv_export_regime":       "nessuno",
             "fv_export_value_eur_kwh": None,
         },
         "tariffs": {
-            "market_price_series":    "prices/it_nord_2024.json",
-            "supplier_spread_eur_kwh": form["spread_eur_kwh"],
+            "market_price_series":      "prices/it_nord_2024.json",
+            "supplier_spread_eur_kwh":  form["spread_eur_kwh"],
             "quota_potenza_eur_kw_mese": form["quota_potenza_eur_kw_mese"],
-            "potenza_contrattuale_kw": round(form["picco_potenza_kw"] * 1.1),
+            "potenza_contrattuale_kw":  round(form["picco_potenza_kw"] * 1.1),
         },
         "bess": {
-            "product_id":             "foxess-gmax-215",
+            "product_id":              "foxess-gmax-215",
             "costo_installato_eur_kwh": 255,
         },
         "simulation": {
@@ -127,6 +128,20 @@ def _build_case(form: dict) -> dict:
         },
     }
     case["bess"] = _resolve_bess(case["bess"])
+
+    # S_FV: proposed FV investment when client has no existing PV
+    kwp_prop = form.get("kwp_proposto", 0)
+    if not ha_pv and kwp_prop > 0:
+        prop_source = "pvgis" if has_lat else "sintetico"
+        case["pv_proposto"] = {
+            "presente":               True,   # needed so build_pv_profile doesn't return zeros
+            "kwp":                    kwp_prop,
+            "profilo_source":         prop_source,
+            "costo_eur_kwp":          form.get("costo_eur_kwp", 800),
+            "anni_vita":              25,
+            "degradazione_annua":     0.005,
+        }
+
     return case
 
 
@@ -345,12 +360,25 @@ def _page_input() -> None:
         st.markdown("### 2 — Impianto fotovoltaico")
         col3, col4 = st.columns(2)
         with col3:
-            ha_pv = st.checkbox("Il sito ha un impianto FV", value=True)
+            ha_pv = st.checkbox("Il sito ha già un impianto FV", value=True)
         with col4:
             kwp = st.number_input(
-                "Potenza FV installata (kWp)", min_value=0, max_value=5_000,
+                "Potenza FV esistente (kWp)", min_value=0, max_value=5_000,
                 value=80, step=5,
-                help="Lascia 0 se non è presente o non è noto")
+                help="Potenza del FV già installato. Lascia 0 se assente")
+
+        col3b, col4b = st.columns(2)
+        with col3b:
+            kwp_proposto = st.number_input(
+                "FV da proporre (kWp) — se non ha FV", min_value=0, max_value=5_000,
+                value=80, step=5,
+                help="Usato solo se il sito non ha FV esistente. "
+                     "Genera la valutazione dell'investimento FV (S_FV).")
+        with col4b:
+            costo_eur_kwp = st.number_input(
+                "Costo FV chiavi in mano (€/kWp)", min_value=0, max_value=3_000,
+                value=800, step=50,
+                help="Range tipico C&I italiano 2025: 700–900 €/kWp (hardware + installazione)")
 
         st.markdown("### 3 — Orari operativi")
         col5, col6 = st.columns(2)
@@ -425,6 +453,8 @@ def _page_input() -> None:
         "picco_potenza_kw":         picco_potenza_kw,
         "ha_pv":                    ha_pv,
         "kwp":                      kwp if ha_pv else 0,
+        "kwp_proposto":             kwp_proposto if not ha_pv else 0,
+        "costo_eur_kwp":            costo_eur_kwp,
         "ore_lavoro_giorno":        ore_lavoro_giorno,
         "giorni_lavoro_settimana":  giorni_lavoro_settimana,
         "spread_eur_kwh":           spread_eur_kwh,
@@ -511,6 +541,34 @@ def _page_results() -> None:
     c4.metric("NPV (20 anni)",   f"{e_best.get('npv_eur', 0):,.0f} €")
     irr = e_best.get("irr_pct")
     c5.metric("IRR",             f"{irr} %" if irr is not None else "—")
+
+    # ── S_FV: proposta impianto FV (Fix 2.1) ─────────────────────────────────
+    e_sfv = econ.get("S_FV")
+    if not ha_pv and e_sfv:
+        st.divider()
+        kwp_prop = e_sfv["kwp"]
+        st.markdown(f"### Prima di tutto: valutazione impianto FV da {kwp_prop} kWp")
+        st.info(
+            "Il sito non ha un impianto FV esistente. "
+            "Senza FV, la batteria ha poco surplus da valorizzare e il rendimento è molto basso. "
+            "**Ti mostriamo prima la convenienza di un impianto FV da zero.**"
+        )
+        fv1, fv2, fv3, fv4, fv5 = st.columns(5)
+        fv1.metric("Investimento FV",    f"{e_sfv['investment_eur']:,.0f} €",
+                   f"{e_sfv['costo_eur_kwp']} €/kWp")
+        fv2.metric("Risparmio anno 1",   f"{e_sfv['saving_y1_eur']:,.0f} €/anno")
+        pb_fv = e_sfv.get("payback_yr")
+        fv3.metric("Payback FV",         f"{pb_fv} anni" if pb_fv else "— anni")
+        fv4.metric("NPV FV (25 anni)",   f"{e_sfv['npv_eur']:,.0f} €")
+        irr_fv = e_sfv.get("irr_pct")
+        fv5.metric("IRR FV",             f"{irr_fv} %" if irr_fv is not None else "—")
+        st.caption(
+            f"Producibilità stimata: {e_sfv['pv_total_kwh']:,.0f} kWh/anno · "
+            f"Autoconsumo diretto: {e_sfv['direct_selfcons_kwh']:,.0f} kWh/anno "
+            f"(SCR {e_sfv['scr_pct']}%, SSR {e_sfv['ssr_pct']}%) · "
+            "Nessun valore di cessione in rete (regime 'nessuno'). "
+            "Degradazione FV 0.5%/anno. Tasso sconto 5%."
+        )
 
     st.divider()
 
