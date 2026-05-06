@@ -247,6 +247,72 @@ def _chart_layers(econ: dict) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
+def _data_quality_level(form: dict) -> tuple[int, str]:
+    """Return (level 1-3, message string) based on available input data."""
+    # Level 3: real hourly curve (not yet implemented in form)
+    # Level 2: monthly consumption breakdown (not yet implemented in form)
+    # Level 1: annual total only (current default)
+    return (
+        1,
+        "**Risultato preliminare — qualità dati: bassa.** "
+        "Il profilo di consumo è sintetico, ricavato dal dato annuale di bolletta. "
+        "Accuratezza indicativa ±40%. Per un'analisi affidabile fornisci la curva di carico oraria.",
+    )
+
+
+def _chart_scenario_ladder(econ: dict, ha_pv: bool) -> None:
+    """Waterfall chart — progressione del costo energetico annuo per scenario."""
+    e1 = econ.get("S1", {})
+    e2 = econ.get("S2", {})
+    e3 = econ.get("S3", {})
+    e4 = econ.get("S4", {})
+    if not e1 or not e3:
+        return
+
+    s1_total = (e1.get("annual_energy_cost_eur", 0)
+                + e1.get("annual_demand_charge_eur", 0))
+    s2_total = (e2.get("annual_energy_cost_eur", 0)
+                + e2.get("annual_demand_charge_eur", 0))
+    s3_saving = e3.get("annual_saving_eur", 0)
+    s4_saving = e4.get("annual_saving_eur", 0)
+    s3_total  = s2_total - s3_saving
+    s4_total  = s2_total - s4_saving
+
+    if ha_pv:
+        x       = ["Senza FV\n(baseline)", "Con FV", "FV + BESS\nautoconsumo", "FV + BESS\nmultilayer"]
+        y       = [s1_total, s2_total - s1_total, s3_total - s2_total, s4_total - s3_total]
+        measure = ["absolute", "relative", "relative", "relative"]
+    else:
+        x       = ["Situazione attuale", "Con BESS\nautoconsumo", "Con BESS\nmultilayer"]
+        y       = [s1_total, s3_total - s1_total, s4_total - s3_total]
+        measure = ["absolute", "relative", "relative"]
+
+    text = []
+    for m, v in zip(measure, y):
+        if m == "absolute":
+            text.append(f"{v:,.0f} €")
+        else:
+            text.append(f"−{abs(v):,.0f} €" if v < 0 else f"+{v:,.0f} €")
+
+    fig = go.Figure(go.Waterfall(
+        orientation="v",
+        measure=measure,
+        x=x, y=y,
+        text=text, textposition="outside",
+        connector=dict(line=dict(color="rgba(0,0,0,0.15)", width=1, dash="dot")),
+        decreasing=dict(marker=dict(color="#2E7D32")),
+        increasing=dict(marker=dict(color="#C62828")),
+        totals=dict(marker=dict(color="#546E7A")),
+    ))
+    fig.update_layout(
+        height=340,
+        yaxis_title="€/anno (costo energetico totale)",
+        margin=dict(t=30, b=20, l=70, r=20),
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
 # ── Step 1 — Input form ───────────────────────────────────────────────────────
 
 def _page_input() -> None:
@@ -413,6 +479,10 @@ def _page_results() -> None:
             st.session_state["step"] = "input"
             st.rerun()
 
+    # ── Data quality banner (Fix 2.3) ─────────────────────────────────────────
+    dq_level, dq_msg = _data_quality_level(form)
+    st.warning(dq_msg, icon="⚠️")
+
     # ── Assumptions box ───────────────────────────────────────────────────────
     with st.expander("📋 Come abbiamo ricostruito lo scenario", expanded=False):
         st.markdown(f"- **Profilo di carico:** {assum['carico']}")
@@ -441,6 +511,36 @@ def _page_results() -> None:
     c4.metric("NPV (20 anni)",   f"{e_best.get('npv_eur', 0):,.0f} €")
     irr = e_best.get("irr_pct")
     c5.metric("IRR",             f"{irr} %" if irr is not None else "—")
+
+    st.divider()
+
+    # ── Scenario ladder — progressione del costo energetico (Fix 2.2) ─────────
+    st.markdown("#### Come si forma il risparmio")
+    _chart_scenario_ladder(econ, ha_pv)
+
+    e1  = econ.get("S1", {})
+    e2  = econ.get("S2", {})
+    e3b = econ.get("S3", {})
+    e4b = econ.get("S4", {})
+    s2_total = (e2.get("annual_energy_cost_eur", 0)
+                + e2.get("annual_demand_charge_eur", 0))
+    if ha_pv and e2:
+        s1_total = (e1.get("annual_energy_cost_eur", 0)
+                    + e1.get("annual_demand_charge_eur", 0))
+        fv_saving = s1_total - s2_total
+        st.caption(
+            f"Il FV da {form.get('kwp', 0)} kWp risparmia **{fv_saving:,.0f} €/anno** sul costo totale. "
+            f"La batteria (autoconsumo) aggiunge **{e3b.get('annual_saving_eur', 0):,.0f} €/anno**. "
+            f"Il peak shaving porta il risparmio aggiuntivo a "
+            f"**{e4b.get('annual_saving_eur', 0) - e3b.get('annual_saving_eur', 0):,.0f} €/anno**. "
+            "Le barre verdi indicano risparmio; il grafico mostra il costo annuo totale (energia + quota potenza)."
+        )
+    else:
+        st.caption(
+            f"La batteria (autoconsumo) risparmia **{e3b.get('annual_saving_eur', 0):,.0f} €/anno**. "
+            f"Il peak shaving aggiunge **{e4b.get('annual_saving_eur', 0) - e3b.get('annual_saving_eur', 0):,.0f} €/anno**. "
+            "Le barre verdi indicano risparmio; il grafico mostra il costo annuo totale (energia + quota potenza)."
+        )
 
     st.divider()
 
