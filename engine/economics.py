@@ -94,18 +94,22 @@ def compute_economics(case: dict, profiles: dict, results: dict) -> dict:
         else:
             saving_quota = 0.0
 
-        # ── Layer 3: shifting margin — S4 only ───────────────────────────────
-        # Revenue = avoided import when discharging grid-sourced energy
-        # Cost    = grid energy purchased during cheap-price charging
-        # Zeroed when no grid charging occurred (disabled in MVP)
-        if sc == "S4" and np.asarray(r_sc["charged_grid_kwh"]).sum() > 0:
-            revenue_shifting = (r_sc["discharged_grid_kwh"] * eta_d * price).sum()
-            cost_grid_charge = (r_sc["charged_grid_kwh"] * price).sum()
-            shifting_margin  = revenue_shifting - cost_grid_charge
+        # ── Grid charging cost (S4) — deducted from Layer 2 ─────────────────
+        # Grid charging is used exclusively for peak-shaving SOC top-up.
+        # Its cost reduces the net Layer 2 saving; it is NOT counted as
+        # Layer 3 arbitrage (that would double-count the discharge value).
+        if sc == "S4":
+            grid_peak_charge_cost = float(
+                (np.asarray(r_sc["charged_grid_kwh"]) * price).sum())
         else:
-            shifting_margin = 0.0
+            grid_peak_charge_cost = 0.0
 
-        annual_saving = saving_fv + saving_quota + shifting_margin
+        # ── Layer 3: shifting margin — disabled in MVP ────────────────────────
+        shifting_margin = 0.0
+
+        saving_quota_gross = saving_quota
+        saving_quota_net   = saving_quota - grid_peak_charge_cost
+        annual_saving      = saving_fv + saving_quota_net + shifting_margin
 
         # ── Battery technical KPIs ────────────────────────────────────────────
         throughput = r_sc["bess_discharge_kw"].sum() * SLOT_H
@@ -160,10 +164,12 @@ def compute_economics(case: dict, profiles: dict, results: dict) -> dict:
 
         out[sc] = {
             # Savings breakdown
-            "saving_fv_eur":       round(saving_fv, 2),
-            "saving_quota_eur":    round(saving_quota, 2),
-            "shifting_margin_eur": round(shifting_margin, 2),
-            "annual_saving_eur":   round(annual_saving, 2),
+            "saving_fv_eur":              round(saving_fv, 2),
+            "saving_quota_gross_eur":     round(saving_quota_gross, 2),
+            "grid_peak_charge_cost_eur":  round(grid_peak_charge_cost, 2),
+            "saving_quota_eur":           round(saving_quota_net, 2),
+            "shifting_margin_eur":        round(shifting_margin, 2),
+            "annual_saving_eur":          round(annual_saving, 2),
             # Self-consumption KPIs
             "direct_selfcons_kwh": round(direct_sc_kwh, 1),
             "bess_sc_kwh":         round(bess_sc_ac_kwh, 1),

@@ -189,17 +189,23 @@ def _chart_weekly(profiles: dict, sim: dict, scenario: str, day_start: int) -> N
     charge = np.array(sim[scenario]["bess_charge_kw"])[s0:s1]
     disc   = np.array(sim[scenario]["bess_discharge_kw"])[s0:s1]
     soc    = np.array(sim[scenario]["soc_kwh"])[s0:s1]
+    price  = np.array(profiles["price_eur_kwh"])[s0:s1]
 
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True,
         row_heights=[0.65, 0.35], vertical_spacing=0.06,
-        subplot_titles=("Potenze (kW)", "SOC batteria (kWh)"),
+        subplot_titles=("Potenze (kW) — asse dx: prezzo energia (€/kWh)", "SOC batteria (kWh)"),
+        specs=[[{"secondary_y": True}], [{"secondary_y": False}]],
     )
-    fig.add_trace(go.Scatter(x=t, y=load,   name="Carico",       line=dict(color="#1565C0", width=2)),              row=1, col=1)
-    fig.add_trace(go.Scatter(x=t, y=pv,     name="FV",           line=dict(color="#F9A825", width=2)),              row=1, col=1)
-    fig.add_trace(go.Scatter(x=t, y=grid,   name="Rete",         line=dict(color="#757575", width=1.5, dash="dot")), row=1, col=1)
-    fig.add_trace(go.Scatter(x=t, y=charge, name="Carica BESS",  line=dict(color="#2E7D32", width=1.5)),            row=1, col=1)
-    fig.add_trace(go.Scatter(x=t, y=-disc,  name="Scarica BESS", line=dict(color="#C62828", width=1.5)),            row=1, col=1)
+    fig.add_trace(go.Scatter(x=t, y=load,   name="Carico",       line=dict(color="#1565C0", width=2)),               row=1, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=t, y=pv,     name="FV",           line=dict(color="#F9A825", width=2)),               row=1, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=t, y=grid,   name="Rete",         line=dict(color="#757575", width=1.5, dash="dot")), row=1, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=t, y=charge, name="Carica BESS",  line=dict(color="#2E7D32", width=1.5)),             row=1, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=t, y=-disc,  name="Scarica BESS", line=dict(color="#C62828", width=1.5)),             row=1, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(
+        x=t, y=price, name="Prezzo energia",
+        line=dict(color="#FF6F00", width=1, dash="dot"), opacity=0.8,
+    ), row=1, col=1, secondary_y=True)
     fig.add_trace(go.Scatter(
         x=t, y=soc, name="SOC", fill="tozeroy",
         line=dict(color="#6A1B9A", width=1.5), fillcolor="rgba(106,27,154,0.12)",
@@ -207,11 +213,13 @@ def _chart_weekly(profiles: dict, sim: dict, scenario: str, day_start: int) -> N
     for d in range(1, 7):
         fig.add_vline(x=d * 24, line_dash="dash", line_color="rgba(0,0,0,0.12)")
     fig.update_xaxes(tickvals=[d * 24 + 12 for d in range(7)], ticktext=_DOW_LABELS, row=2, col=1)
-    fig.update_yaxes(title_text="kW",  row=1, col=1)
-    fig.update_yaxes(title_text="kWh", row=2, col=1)
+    fig.update_yaxes(title_text="kW",     row=1, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="€/kWh",  row=1, col=1, secondary_y=True,
+                     showgrid=False, rangemode="tozero")
+    fig.update_yaxes(title_text="kWh",    row=2, col=1)
     fig.update_layout(
-        height=500, hovermode="x unified",
-        margin=dict(t=40, b=10, l=60, r=20),
+        height=520, hovermode="x unified",
+        margin=dict(t=40, b=10, l=60, r=60),
         legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="right", x=1),
     )
     st.plotly_chart(fig, use_container_width=True)
