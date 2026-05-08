@@ -1658,6 +1658,146 @@ def _build_effective_model(
     return result
 
 
+# ── Sezione 2.3 helpers ────────────────────────────────────────────────────────
+
+def _s2_fv_hourly_from_monthly(pv_monthly: list) -> list:
+    """Profilo FV orario sintetico (8760 h) che rispetta i totali mensili PVGIS."""
+    import math
+    _SIGMA = 3.0
+    _DAYS  = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    _gauss_daily_sum = sum(
+        math.exp(-0.5 * ((h + 0.5 - 12.5) / _SIGMA) ** 2) for h in range(24)
+    )
+    fv = []
+    for m, days in enumerate(_DAYS):
+        daily_kwh = pv_monthly[m] / days if days > 0 else 0.0
+        scale = daily_kwh / _gauss_daily_sum if _gauss_daily_sum > 0 else 0.0
+        for _ in range(days):
+            for h in range(24):
+                fv.append(max(0.0, math.exp(-0.5 * ((h + 0.5 - 12.5) / _SIGMA) ** 2) * scale))
+    return fv
+
+
+def _s2_extract_f123_from_grid(grid: list) -> tuple:
+    """Estrae F1/F2/F3 e picchi da effective_model (12 righe). Fallback 50/25/25 se F1/F2/F3 assenti."""
+    f1 = [row.get("f1_kwh") or 0.0 for row in grid]
+    f2 = [row.get("f2_kwh") or 0.0 for row in grid]
+    f3 = [row.get("f3_kwh") or 0.0 for row in grid]
+    if not any(f1) and not any(f2) and not any(f3):
+        totals = [row.get("consumo_kwh") or 0.0 for row in grid]
+        f1 = [v * 0.50 for v in totals]
+        f2 = [v * 0.25 for v in totals]
+        f3 = [v * 0.25 for v in totals]
+    picchi = [row.get("picco_kw") or 0.0 for row in grid]
+    return f1, f2, f3, picchi
+
+
+def _s2_section_cache_key(kwp, tilt, azimuth, pv_monthly, user_constraints, grid) -> str:
+    import hashlib, json
+    grid_summary = [
+        {"f1": row.get("f1_kwh"), "f2": row.get("f2_kwh"),
+         "f3": row.get("f3_kwh"), "pk": row.get("picco_kw"),
+         "c": row.get("consumo_kwh")}
+        for row in (grid or [])
+    ]
+    payload = {
+        "kwp": kwp, "tilt": tilt, "az": azimuth,
+        "pv": pv_monthly, "uc": user_constraints, "grid": grid_summary,
+    }
+    return hashlib.md5(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _build_section_2_reconstruction(
+    effective_model: list,
+    pv_monthly: list,
+    kwp: float,
+    tilt: float,
+    azimuth: float,
+    user_constraints,
+) -> dict | None:
+    """
+    Chiama reconcile() con i dati attuali del form (senza SDI completo).
+    Ritorna dict con KPI e serie mensili, o None se dati insufficienti.
+    """
+    from intake.site_reconstruction import SiteEnergyState, reconcile
+
+    if not effective_model or not pv_monthly or kwp <= 0:
+        return None
+    if not any(row.get("consumo_kwh") for row in effective_model):
+        return None
+
+    f1, f2, f3, picchi = _s2_extract_f123_from_grid(effective_model)
+    fv_oraria = _s2_fv_hourly_from_monthly(pv_monthly)
+    anno_ref = next((row.get("anno") for row in effective_model if row.get("anno")), 2025)
+    quota_pot = float(st.session_state.get("intake_quota", 12.0) or 12.0)
+
+    uc = user_constraints or {}
+    user_ac_pct_ann = user_ac_pct_mens = user_sup_ann = user_sup_mens = None
+    if uc.get("type") == "autoconsumo_pct" and uc.get("scope") == "annuo":
+        user_ac_pct_ann = float(uc.get("annual_value") or 0)
+    elif uc.get("type") == "autoconsumo_pct" and uc.get("scope") == "mensile":
+        user_ac_pct_mens = [float(v) for v in uc.get("monthly_values") or [0] * 12]
+    elif uc.get("type") == "surplus_kwh" and uc.get("scope") == "annuo":
+        user_sup_ann = float(uc.get("annual_value") or 0)
+    elif uc.get("type") == "surplus_kwh" and uc.get("scope") == "mensile":
+        user_sup_mens = [float(v) for v in uc.get("monthly_values") or [0] * 12]
+
+    state = SiteEnergyState(
+        prelievo_f1_mensile=f1,
+        prelievo_f2_mensile=f2,
+        prelievo_f3_mensile=f3,
+        picchi_mensili_kw=picchi,
+        quota_potenza_eur_kw_mese=quota_pot,
+        has_fv=True,
+        fv_kwp=float(kwp),
+        fv_tilt=float(tilt),
+        fv_azimuth=float(azimuth),
+        fv_oraria_pvgis_kw=fv_oraria,
+        fv_mensile_pvgis_kwh=list(pv_monthly),
+        anno_riferimento=anno_ref,
+        user_autoconsumo_pct_annuo=user_ac_pct_ann,
+        user_autoconsumo_pct_mensile=user_ac_pct_mens,
+        user_surplus_kwh_annuo=user_sup_ann,
+        user_surplus_kwh_mensile=user_sup_mens,
+    )
+
+    try:
+        state = reconcile(state)
+    except (ValueError, RuntimeError) as e:
+        return {"error": str(e)}
+
+    prelievo_mensile = [f1[m] + f2[m] + f3[m] for m in range(12)]
+    fabb_ann = state.fabbisogno_annuo_kwh.value   if state.fabbisogno_annuo_kwh   else 0.0
+    ac_ann   = state.autoconsumo_fv_annuo_kwh.value if state.autoconsumo_fv_annuo_kwh else 0.0
+    sup_ann  = state.surplus_fv_annuo_kwh.value   if state.surplus_fv_annuo_kwh   else 0.0
+    fv_tot   = sum(pv_monthly)
+    spread   = float(st.session_state.get("intake_spread", 0.095) or 0.095)
+
+    return {
+        "fabbisogno_annuo":    fabb_ann,
+        "autoconsumo_annuo":   ac_ann,
+        "surplus_annuo":       sup_ann,
+        "autoconsumo_pct":     (ac_ann / fv_tot * 100.0) if fv_tot > 0 else 0.0,
+        "autosufficienza_pct": (ac_ann / fabb_ann * 100.0) if fabb_ann > 0 else 0.0,
+        "costo_evitato_eur":   ac_ann * spread,
+        "fabbisogno_mensile":  [v.value for v in (state.fabbisogno_mensile_kwh  or [])],
+        "autoconsumo_mensile": [v.value for v in (state.autoconsumo_fv_mensile_kwh or [])],
+        "surplus_mensile":     [v.value for v in (state.surplus_fv_mensile_kwh  or [])],
+        "prelievo_mensile":    prelievo_mensile,
+        "fv_mensile":          list(pv_monthly),
+        "picchi_mensili":      picchi,
+        "reconcile_mode":      state.reconcile_mode or "auto",
+        "autoconsumo_source":  (
+            state.autoconsumo_fv_annuo_kwh.source
+            if state.autoconsumo_fv_annuo_kwh else "estimated"
+        ),
+        "overall_confidence":  state.overall_confidence or "medium",
+        "band_match_error_pct": state.band_match_error_pct or {},
+        "assumptions_active":  list(state.assumptions_active or []),
+        "spread":              spread,
+    }
+
+
 def _fband_simple(day: int, slot: int) -> str:
     """Approssimazione fasce F1/F2/F3 per il blocco coerenza (senza festivi)."""
     h = slot // 4
@@ -2694,6 +2834,187 @@ def _page_block1_intake() -> None:
             sc3.metric("Potenza di picco", f"{_s_peak_kw:.2f} kW")
             st.caption("⚪ stimato — forma sintetica da totali mensili PVGIS")
 
+            # ── Sezione 2.3: Ricostruzione del consumo del sito ─────────────
+            _uc_for_s2 = st.session_state.get("intake_user_constraints")
+            _s2_key = _s2_section_cache_key(
+                kwp, tilt, azimuth, pv_monthly, _uc_for_s2, effective_model
+            )
+            _s2_cached = st.session_state.get("_s2_recon_cache") or {}
+            if _s2_cached.get("key") != _s2_key:
+                with st.spinner("Ricostruzione consumo del sito…"):
+                    _s2_data = _build_section_2_reconstruction(
+                        effective_model, pv_monthly, kwp, tilt, azimuth, _uc_for_s2
+                    )
+                st.session_state["_s2_recon_cache"] = {"key": _s2_key, "data": _s2_data}
+            _recon = st.session_state["_s2_recon_cache"]["data"]
+
+            st.divider()
+            st.markdown("### Ricostruzione del consumo del sito")
+            st.caption(
+                "Combinando i dati di bolletta con la produzione FV, il modello stima quanta "
+                "energia il sito consuma realmente, quanta arriva dalla rete e quanta dal FV."
+            )
+
+            if _recon is None:
+                st.info(
+                    "Per visualizzare la ricostruzione, completa la sezione 1 (bollette) "
+                    "e calcola la produzione FV qui sopra."
+                )
+            elif "error" in _recon:
+                st.error(f"Errore nella ricostruzione: {_recon['error']}")
+            else:
+                # ── 2.3.1 Frase narrativa ────────────────────────────────────
+                _r_fabb   = _recon["fabbisogno_annuo"]
+                _r_prel   = sum(_recon["prelievo_mensile"])
+                _r_ac     = _recon["autoconsumo_annuo"]
+                _r_fv_tot = sum(_recon["fv_mensile"])
+                _r_surp   = _recon["surplus_annuo"]
+                st.markdown(
+                    f"**Il sito consuma {_r_fabb:,.0f} kWh/anno.** "
+                    f"Di questi, {_r_prel:,.0f} kWh vengono acquistati dalla rete (bolletta) "
+                    f"e {_r_ac:,.0f} kWh sono autoconsumati direttamente dal FV. "
+                    f"Il FV produce {_r_fv_tot:,.0f} kWh/anno: {_r_ac:,.0f} consumati in loco, "
+                    f"{_r_surp:,.0f} ceduti alla rete come surplus."
+                )
+
+                # ── 2.3.2 KPI principali ─────────────────────────────────────
+                st.markdown("")
+                _kp1, _kp2, _kp3 = st.columns(3)
+                _ac_src = _recon.get("autoconsumo_source", "estimated")
+                if _ac_src == "user_input":
+                    _ac_dot, _ac_lbl = "🟢", "dichiarato dall'utente"
+                else:
+                    _ac_dot, _ac_lbl = "🟡", "stimato (modello calibrato)"
+
+                with _kp1:
+                    st.metric("Fabbisogno annuo sito", f"{_recon['fabbisogno_annuo']:,.0f} kWh")
+                    st.caption("Energia totale consumata dal sito in un anno.")
+                    st.caption("🟡 derivato (bolletta + FV)")
+                with _kp2:
+                    st.metric("Autoconsumo FV", f"{_recon['autoconsumo_annuo']:,.0f} kWh")
+                    st.caption("Energia FV consumata in loco, senza passare dalla rete.")
+                    st.caption(f"{_ac_dot} {_ac_lbl}")
+                with _kp3:
+                    st.metric("Surplus FV (rete)", f"{_recon['surplus_annuo']:,.0f} kWh")
+                    st.caption("Energia FV prodotta in eccesso, ceduta alla rete.")
+                    st.caption(f"{_ac_dot} {_ac_lbl}")
+
+                # ── 2.3.3 KPI secondari ──────────────────────────────────────
+                st.markdown("")
+                _ks1, _ks2, _ks3 = st.columns(3)
+                with _ks1:
+                    st.metric("Autosufficienza energetica", f"{_recon['autosufficienza_pct']:.1f}%")
+                    st.caption("Quota del fabbisogno coperta direttamente dal FV.")
+                    st.caption("🟡 derivato")
+                with _ks2:
+                    st.metric("Autoconsumo FV %", f"{_recon['autoconsumo_pct']:.1f}%")
+                    st.caption("Quota del FV prodotto consumata in loco.")
+                    st.caption(f"{_ac_dot} {_ac_lbl}")
+                with _ks3:
+                    _spread_disp = _recon.get("spread", 0.095)
+                    st.metric("Costo evitato dal FV", f"{_recon['costo_evitato_eur']:,.0f} €/anno")
+                    st.caption("Risparmio annuo grazie all'autoconsumo FV.")
+                    st.caption(f"🟡 derivato (×{_spread_disp:.3f} €/kWh)")
+
+                # ── 2.3.4 Grafico mensile ────────────────────────────────────
+                st.markdown("")
+                st.markdown("**Bilancio energetico mensile**")
+                st.caption(
+                    "Click sulla legenda per nascondere/mostrare le serie. "
+                    "Le barre sono impilate; le linee sono overlay (nascoste di default)."
+                )
+                _mesi_s2 = ["Gen", "Feb", "Mar", "Apr", "Mag", "Giu",
+                            "Lug", "Ago", "Set", "Ott", "Nov", "Dic"]
+                _fig_s2 = go.Figure()
+                _fig_s2.add_trace(go.Bar(
+                    x=_mesi_s2, y=_recon["prelievo_mensile"],
+                    name="Prelievo da rete", marker_color="#2E7D32",
+                    hovertemplate="%{y:,.0f} kWh<extra></extra>",
+                ))
+                _fig_s2.add_trace(go.Bar(
+                    x=_mesi_s2, y=_recon["autoconsumo_mensile"],
+                    name="Autoconsumo FV", marker_color="#7CB342",
+                    hovertemplate="%{y:,.0f} kWh<extra></extra>",
+                ))
+                _fig_s2.add_trace(go.Bar(
+                    x=_mesi_s2, y=_recon["surplus_mensile"],
+                    name="Surplus FV", marker_color="#F9A825",
+                    hovertemplate="%{y:,.0f} kWh<extra></extra>",
+                ))
+                _fig_s2.add_trace(go.Scatter(
+                    x=_mesi_s2, y=_recon["fv_mensile"],
+                    name="FV totale prodotto", mode="lines+markers",
+                    line=dict(color="#F9A825", width=2, dash="dash"),
+                    marker=dict(size=6), visible="legendonly",
+                    hovertemplate="FV: %{y:,.0f} kWh<extra></extra>",
+                ))
+                _fig_s2.add_trace(go.Scatter(
+                    x=_mesi_s2, y=_recon["fabbisogno_mensile"],
+                    name="Fabbisogno totale", mode="lines+markers",
+                    line=dict(color="#1565C0", width=2, dash="dash"),
+                    marker=dict(size=6), visible="legendonly",
+                    hovertemplate="Fabbisogno: %{y:,.0f} kWh<extra></extra>",
+                ))
+                if any(p > 0 for p in _recon["picchi_mensili"]):
+                    _fig_s2.add_trace(go.Scatter(
+                        x=_mesi_s2, y=_recon["picchi_mensili"],
+                        name="Picchi mensili (kW)", mode="lines+markers",
+                        line=dict(color="#C62828", width=2),
+                        marker=dict(size=6), yaxis="y2", visible="legendonly",
+                        hovertemplate="Picco: %{y:.1f} kW<extra></extra>",
+                    ))
+                _fig_s2.update_layout(
+                    barmode="stack", height=420,
+                    margin=dict(l=10, r=10, t=10, b=40),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                    yaxis=dict(title="kWh"),
+                    yaxis2=dict(title="kW (picchi)", overlaying="y", side="right", showgrid=False),
+                    hovermode="x unified",
+                )
+                st.plotly_chart(_fig_s2, use_container_width=True)
+
+                # ── 2.3.5 Tabella mensile ────────────────────────────────────
+                st.markdown("**Dettaglio mensile**")
+                import pandas as _pd_s2
+                _df_s2 = _pd_s2.DataFrame({
+                    "Mese": _mesi_s2,
+                    "Fabbisogno (kWh)":    [round(v) for v in _recon["fabbisogno_mensile"]],
+                    "Prelievo rete (kWh)": [round(v) for v in _recon["prelievo_mensile"]],
+                    "FV prodotto (kWh)":   [round(v) for v in _recon["fv_mensile"]],
+                    "Autoconsumo (kWh)":   [round(v) for v in _recon["autoconsumo_mensile"]],
+                    "Surplus (kWh)":       [round(v) for v in _recon["surplus_mensile"]],
+                    "% AC del FV": [
+                        f"{(ac / fv * 100):.0f}%" if fv > 0 else "—"
+                        for ac, fv in zip(_recon["autoconsumo_mensile"], _recon["fv_mensile"])
+                    ],
+                })
+                st.dataframe(_df_s2, hide_index=True, use_container_width=True)
+
+                # ── 2.3.6 Expander dettagli tecnici ─────────────────────────
+                with st.expander("Dettagli tecnici · qualità del modello", expanded=False):
+                    _conf = _recon.get("overall_confidence", "medium")
+                    _conf_emoji = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(_conf, "⚪")
+                    st.markdown(f"**Confidenza globale**: {_conf_emoji} {_conf}")
+                    _bme = _recon.get("band_match_error_pct") or {}
+                    if _bme:
+                        _errs_str = " · ".join(
+                            f"{k.upper()}: {abs(v):.1f}%" for k, v in _bme.items()
+                        )
+                        _avg_err = sum(abs(v) for v in _bme.values()) / len(_bme)
+                        st.markdown(f"**Errore F1/F2/F3** (medio {_avg_err:.1f}%): {_errs_str}")
+                    _mode_s2 = _recon.get("reconcile_mode", "auto")
+                    _mode_lbl = {
+                        "auto": "Auto — bolletta + FV PVGIS",
+                        "constrained_annual": "Vincolata annua — autoconsumo dichiarato",
+                        "constrained_monthly": "Vincolata mensile — 12 mesi dichiarati",
+                    }.get(_mode_s2, _mode_s2)
+                    st.markdown(f"**Modalità modello**: {_mode_lbl}")
+                    _assum = _recon.get("assumptions_active") or []
+                    if _assum:
+                        st.markdown("**Assunzioni attive:**")
+                        for _a in _assum:
+                            st.caption(f"• {_a}")
+
             # ── Expander: vincoli utente autoconsumo (Brief 6) ────────────────
             with st.expander("Hai dati specifici sull'autoconsumo?", expanded=False):
                 st.caption(
@@ -2800,6 +3121,10 @@ def _page_block1_intake() -> None:
                     st.session_state["intake_user_constraints"] = _user_constraints
                 else:
                     st.session_state.pop("intake_user_constraints", None)
+
+                st.markdown("")
+                if st.button("✓ Applica vincolo", key="btn_apply_uc", type="primary"):
+                    st.rerun()
 
         else:
             st.info(
