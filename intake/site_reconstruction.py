@@ -337,17 +337,25 @@ def _aggregate_monthly(profile_qh_kw: np.ndarray, time_index: dict) -> list[floa
     ]
 
 
-def _calibrate_load(state: SiteEnergyState, time_index: dict) -> dict:
+def _calibrate_load(
+    state: SiteEnergyState,
+    time_index: dict,
+    mode: str = "auto",
+    target_ac: dict | None = None,
+) -> dict:
     """
     Ottimizzazione Nelder-Mead: trova i 3 parametri di profilo che minimizzano
     lo scarto tra prelievo modellato e prelievo bolletta su 36 osservazioni
-    (12 mesi × 3 fasce F1/F2/F3).
+    (12 mesi × 3 fasce F1/F2/F3). In modalità vincolata aggiunge un termine
+    soft sull'autoconsumo (peso 5.0).
     """
     months     = time_index["month"]
     band_masks = time_index["band_masks"]
     fv_qh      = state.fv_profile_qh_kw  # già calcolato prima di _calibrate_load
 
     def loss(p: np.ndarray) -> float:
+        ac_penalty = 0.0  # inizializzato come prima riga, prima di qualunque condizione
+
         params = {
             "base_load_kw":       p[0],
             "production_amp_kw":  p[1],
@@ -377,10 +385,24 @@ def _calibrate_load(state: SiteEnergyState, time_index: dict) -> dict:
                 stim_peak = float(grid_kw[mm].max())
                 peak_pen += ((stim_peak - tgt) / max(tgt, 10.0)) ** 2
 
+        # Penalità vincolo autoconsumo (peso 5.0)
+        if target_ac is not None and state.has_fv:
+            ac_qh = np.minimum(load_kw, fv_qh)
+            if mode == "constrained_annual" and target_ac["annuo"] is not None:
+                ac_stim = float(ac_qh.sum() * _SLOT_H)
+                denom   = max(target_ac["annuo"], 1000.0)
+                ac_penalty = ((ac_stim - target_ac["annuo"]) / denom) ** 2
+            elif mode == "constrained_monthly" and target_ac["mensile"] is not None:
+                for m in range(12):
+                    mm = months == (m + 1)
+                    ac_stim_m = float(ac_qh[mm].sum() * _SLOT_H)
+                    denom_m   = max(target_ac["mensile"][m], 100.0)
+                    ac_penalty += ((ac_stim_m - target_ac["mensile"][m]) / denom_m) ** 2
+
         # Penalità parametri negativi
         penalty = sum(1e6 * v ** 2 for v in p if v < 0)
 
-        return loss_val + 0.1 * peak_pen + penalty
+        return loss_val + 0.1 * peak_pen + 5.0 * ac_penalty + penalty
 
     # Stima iniziale basata sui dati di bolletta
     f3_total    = sum(state.prelievo_f3_mensile)
@@ -437,15 +459,110 @@ def _compute_overall_confidence(state: SiteEnergyState) -> ConfidenceType:
     return "low"
 
 
+# ── Helpers modalità vincolate ───────────────────────────────────────────────
+
+def _classify_constraints(state: SiteEnergyState) -> str:
+    """Esamina i campi user_* e ritorna la modalità: 'auto', 'constrained_annual', 'constrained_monthly'."""
+    has_ac_ann  = state.user_autoconsumo_pct_annuo   is not None
+    has_ac_mens = state.user_autoconsumo_pct_mensile is not None
+    has_sup_ann = state.user_surplus_kwh_annuo       is not None
+    has_sup_men = state.user_surplus_kwh_mensile     is not None
+
+    if not any([has_ac_ann, has_ac_mens, has_sup_ann, has_sup_men]):
+        return "auto"
+
+    has_ac  = has_ac_ann or has_ac_mens
+    has_sup = has_sup_ann or has_sup_men
+    if has_ac and has_sup:
+        raise ValueError(
+            "Vincoli incompatibili: % autoconsumo e kWh immessi sono mutuamente "
+            "esclusivi. Fornire uno solo dei due tipi."
+        )
+    if has_ac_ann and has_ac_mens:
+        raise ValueError("Vincoli autoconsumo: forniti sia annuo che mensile. Sceglierne uno solo.")
+    if has_sup_ann and has_sup_men:
+        raise ValueError("Vincoli surplus: forniti sia annuo che mensile. Sceglierne uno solo.")
+
+    if has_ac_mens:
+        v = state.user_autoconsumo_pct_mensile
+        if len(v) != 12 or any(x is None for x in v):
+            raise ValueError("Vincolo autoconsumo mensile: devono essere forniti tutti e 12 i mesi.")
+        return "constrained_monthly"
+    if has_sup_men:
+        v = state.user_surplus_kwh_mensile
+        if len(v) != 12 or any(x is None for x in v):
+            raise ValueError("Vincolo surplus mensile: devono essere forniti tutti e 12 i mesi.")
+        return "constrained_monthly"
+    return "constrained_annual"
+
+
+def _user_to_target_autoconsumo(state: SiteEnergyState) -> dict:
+    """
+    Converte i vincoli utente in target uniformi espressi in kWh autoconsumo.
+
+    Ritorna {"annuo": float|None, "mensile": list[float]|None, "warnings": list[str]}.
+    """
+    fv_ann  = sum(state.fv_mensile_pvgis_kwh) if state.fv_mensile_pvgis_kwh else 0.0
+    fv_mens = state.fv_mensile_pvgis_kwh or [0.0] * 12
+    out: dict = {"annuo": None, "mensile": None, "warnings": []}
+
+    if state.user_autoconsumo_pct_annuo is not None:
+        pct = state.user_autoconsumo_pct_annuo
+        if not (0.0 <= pct <= 100.0):
+            raise ValueError(f"% autoconsumo annuo fuori range [0,100]: {pct}")
+        out["annuo"] = pct / 100.0 * fv_ann
+
+    elif state.user_surplus_kwh_annuo is not None:
+        sup = state.user_surplus_kwh_annuo
+        if sup < 0:
+            raise ValueError(f"Surplus annuo negativo: {sup}")
+        ac = fv_ann - sup
+        if ac < 0:
+            ac = 0.0
+            out["warnings"].append(
+                f"Surplus dichiarato {sup:,.0f} kWh > FV prodotto {fv_ann:,.0f} kWh. "
+                "Autoconsumo saturato a 0."
+            )
+        out["annuo"] = ac
+
+    elif state.user_autoconsumo_pct_mensile is not None:
+        out["mensile"] = []
+        for m in range(12):
+            pct = state.user_autoconsumo_pct_mensile[m]
+            if not (0.0 <= pct <= 100.0):
+                raise ValueError(f"% autoconsumo mese {m+1} fuori range [0,100]: {pct}")
+            out["mensile"].append(pct / 100.0 * fv_mens[m])
+        out["annuo"] = sum(out["mensile"])
+
+    elif state.user_surplus_kwh_mensile is not None:
+        out["mensile"] = []
+        for m in range(12):
+            sup = state.user_surplus_kwh_mensile[m]
+            if sup < 0:
+                raise ValueError(f"Surplus mese {m+1} negativo: {sup}")
+            ac = fv_mens[m] - sup
+            if ac < 0:
+                ac = 0.0
+                out["warnings"].append(
+                    f"Mese {m+1}: surplus {sup:,.0f} kWh > FV {fv_mens[m]:,.0f} kWh. "
+                    "Autoconsumo saturato a 0."
+                )
+            out["mensile"].append(ac)
+        out["annuo"] = sum(out["mensile"])
+
+    return out
+
+
 # ── Funzione pubblica ─────────────────────────────────────────────────────────
 
 def reconcile(state: SiteEnergyState) -> SiteEnergyState:
     """
     Ricalcola tutti i campi derivati di SiteEnergyState.
 
-    In Brief 1 supporta solo la modalità "auto": profilo sintetico calibrato
-    su F1/F2/F3 mensili e picchi di bolletta. I vincoli utente su autoconsumo
-    o surplus alzano NotImplementedError (saranno implementati in Brief 3).
+    Modalità supportate:
+      "auto"                — profilo sintetico calibrato su F1/F2/F3 mensili + picchi
+      "constrained_annual"  — vincolo annuo utente (% autoconsumo o kWh surplus)
+      "constrained_monthly" — vincolo mensile completo (12 valori)
 
     Non modifica gli array di input in-place.
     """
@@ -462,19 +579,8 @@ def reconcile(state: SiteEnergyState) -> SiteEnergyState:
                 f"trovati {len(state.fv_oraria_pvgis_kw)}."
             )
 
-    if any(v is not None for v in (
-        state.user_autoconsumo_pct_annuo,
-        state.user_autoconsumo_pct_mensile,
-        state.user_surplus_kwh_annuo,
-        state.user_surplus_kwh_mensile,
-    )):
-        raise NotImplementedError(
-            "Modalità vincolata (user_autoconsumo_pct_* / user_surplus_*) "
-            "sarà implementata nel Brief 3."
-        )
-
-    picchi_ok = sum(state.picchi_mensili_kw) > 0
-    state.reconcile_mode = "auto"
+    state.reconcile_mode  = _classify_constraints(state)
+    picchi_ok             = sum(state.picchi_mensili_kw) > 0
     state.assumptions_active = []
 
     # ── 2. Time index ─────────────────────────────────────────────────────────
@@ -500,7 +606,12 @@ def reconcile(state: SiteEnergyState) -> SiteEnergyState:
     )
 
     # ── 5. Calibrazione ───────────────────────────────────────────────────────
-    cal = _calibrate_load(state, ti)
+    target_ac = None
+    if state.reconcile_mode in ("constrained_annual", "constrained_monthly"):
+        target_ac = _user_to_target_autoconsumo(state)
+        state.assumptions_active.extend(target_ac["warnings"])
+
+    cal = _calibrate_load(state, ti, mode=state.reconcile_mode, target_ac=target_ac)
     state.calibration_loss = cal["loss"]
 
     state.assumptions_active.append(
@@ -509,6 +620,18 @@ def reconcile(state: SiteEnergyState) -> SiteEnergyState:
     if not picchi_ok:
         state.assumptions_active.append(
             "⚠ Picchi mensili non forniti — calibrazione picco disabilitata"
+        )
+
+    if state.reconcile_mode == "constrained_annual" and target_ac is not None:
+        fv_ann_ref2 = sum(state.fv_mensile_pvgis_kwh) if state.fv_mensile_pvgis_kwh else 1.0
+        state.assumptions_active.append(
+            f"Vincolo utente attivo: autoconsumo annuo = "
+            f"{target_ac['annuo']:,.0f} kWh "
+            f"({target_ac['annuo'] / max(fv_ann_ref2, 1.0) * 100:.1f}% del FV prodotto)"
+        )
+    elif state.reconcile_mode == "constrained_monthly":
+        state.assumptions_active.append(
+            "Vincolo utente attivo: autoconsumo mensile dettagliato (12 mesi)"
         )
 
     # ── 6. Profilo load finale ────────────────────────────────────────────────
@@ -536,44 +659,86 @@ def reconcile(state: SiteEnergyState) -> SiteEnergyState:
     surplus_monthly = _aggregate_monthly(surplus_qh, ti)
     grid_monthly   = _aggregate_monthly(grid_qh,    ti)
 
-    # fabbisogno = prelievo_rete (modellato) + autoconsumo
-    fabb_monthly = [load_monthly[m] for m in range(12)]
+    # ── Hard enforcement vincoli utente ──────────────────────────────────────
+    # NB: load_monthly, ac_monthly, surplus_monthly già calcolati sopra da _aggregate_monthly.
+    # In auto mode (target_ac is None) questo blocco non li sovrascrive.
+    prelievo_mensile = [
+        state.prelievo_f1_mensile[m] + state.prelievo_f2_mensile[m] + state.prelievo_f3_mensile[m]
+        for m in range(12)
+    ]
+    fv_mensile_ref = state.fv_mensile_pvgis_kwh or [0.0] * 12
+
+    if target_ac is not None:
+        if state.reconcile_mode == "constrained_annual":
+            ac_model_ann = sum(ac_monthly)
+            if ac_model_ann > 0:
+                scale = target_ac["annuo"] / ac_model_ann
+                ac_monthly = [v * scale for v in ac_monthly]
+            else:
+                fv_ann_ref = sum(fv_mensile_ref)
+                ac_monthly = [
+                    target_ac["annuo"] * fv_mensile_ref[m] / fv_ann_ref if fv_ann_ref > 0 else 0.0
+                    for m in range(12)
+                ]
+            surplus_monthly = [max(0.0, fv_mensile_ref[m] - ac_monthly[m]) for m in range(12)]
+            fabb_monthly    = [prelievo_mensile[m] + ac_monthly[m] for m in range(12)]
+        elif state.reconcile_mode == "constrained_monthly":
+            ac_monthly      = list(target_ac["mensile"])
+            surplus_monthly = [max(0.0, fv_mensile_ref[m] - ac_monthly[m]) for m in range(12)]
+            fabb_monthly    = [prelievo_mensile[m] + ac_monthly[m] for m in range(12)]
+        else:
+            fabb_monthly = [load_monthly[m] for m in range(12)]
+    else:
+        # modalità auto: ac_monthly e surplus_monthly intatti dall'aggregazione
+        fabb_monthly = [load_monthly[m] for m in range(12)]
+
+    # Source/confidence in base al mode
+    if state.reconcile_mode == "auto":
+        ac_source, ac_conf           = "estimated", "medium"
+        fabb_source, fabb_conf       = "estimated", "medium"
+        monthly_source, monthly_conf = "estimated", "medium"
+    else:
+        ac_source, ac_conf           = "user_input", "high"
+        fabb_source, fabb_conf       = "derived",    "high"
+        if state.reconcile_mode == "constrained_monthly":
+            monthly_source, monthly_conf = "user_input", "high"
+        else:
+            monthly_source, monthly_conf = "estimated",  "medium"
 
     # Prepara TrackedValue mensili
     state.fabbisogno_mensile_kwh = [
-        TrackedValue(v, "estimated", "medium") for v in fabb_monthly
+        TrackedValue(v, fabb_source, fabb_conf) for v in fabb_monthly
     ]
     state.autoconsumo_fv_mensile_kwh = [
-        TrackedValue(v, "estimated", "medium") for v in ac_monthly
+        TrackedValue(v, monthly_source, monthly_conf) for v in ac_monthly
     ]
     state.surplus_fv_mensile_kwh = [
-        TrackedValue(v, "estimated", "medium") for v in surplus_monthly
+        TrackedValue(v, monthly_source, monthly_conf) for v in surplus_monthly
     ]
 
-    fabb_ann     = sum(fabb_monthly)
-    ac_ann       = sum(ac_monthly)
-    surplus_ann  = sum(surplus_monthly)
+    fabb_ann    = sum(fabb_monthly)
+    ac_ann      = sum(ac_monthly)
+    surplus_ann = sum(surplus_monthly)
 
-    state.fabbisogno_annuo_kwh     = TrackedValue(fabb_ann,    "estimated", "medium")
-    state.autoconsumo_fv_annuo_kwh = TrackedValue(ac_ann,      "estimated", "medium")
-    state.surplus_fv_annuo_kwh     = TrackedValue(surplus_ann, "estimated", "medium")
+    state.fabbisogno_annuo_kwh     = TrackedValue(fabb_ann,    fabb_source, fabb_conf)
+    state.autoconsumo_fv_annuo_kwh = TrackedValue(ac_ann,      ac_source,   ac_conf)
+    state.surplus_fv_annuo_kwh     = TrackedValue(surplus_ann, ac_source,   ac_conf)
 
     # % autoconsumo = autoconsumo / fv_prodotta (se FV presente)
     fv_ann = sum(state.fv_mensile_pvgis_kwh) if state.fv_mensile_pvgis_kwh else float(fv_qh.sum() * _SLOT_H)
     if fv_ann > 0:
         pct_ann = ac_ann / fv_ann * 100.0
-        state.autoconsumo_pct_annuo = TrackedValue(pct_ann, "estimated", "medium")
+        state.autoconsumo_pct_annuo = TrackedValue(pct_ann, ac_source, ac_conf)
         state.autoconsumo_pct_mensile = [
             TrackedValue(
-                ac_monthly[m] / max(state.fv_mensile_pvgis_kwh[m], 1.0) * 100.0
-                if state.fv_mensile_pvgis_kwh else 0.0,
-                "estimated", "medium",
+                ac_monthly[m] / max(fv_mensile_ref[m], 1.0) * 100.0,
+                monthly_source, monthly_conf,
             )
             for m in range(12)
         ]
     else:
-        state.autoconsumo_pct_annuo   = TrackedValue(0.0, "estimated", "medium")
-        state.autoconsumo_pct_mensile = [TrackedValue(0.0, "estimated", "medium")] * 12
+        state.autoconsumo_pct_annuo   = TrackedValue(0.0, ac_source, ac_conf)
+        state.autoconsumo_pct_mensile = [TrackedValue(0.0, ac_source, ac_conf)] * 12
 
     # ── 9. Diagnostica ────────────────────────────────────────────────────────
     prelievo_bolletta_ann = {

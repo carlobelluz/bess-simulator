@@ -277,7 +277,7 @@ def _build_pv_existing(form: dict, lat, lon) -> dict | None:
     # Use PVGIS when site coordinates are known; fall back to synthetic
     profilo_source = "pvgis" if (lat is not None and lon is not None) else "sintetico"
 
-    return {
+    pv = {
         "presente":       True,
         "kwp":            _wrap(kwp, "user_input", "high"),
         "tilt": {
@@ -296,6 +296,18 @@ def _build_pv_existing(form: dict, lat, lon) -> dict | None:
         "profilo_source":        profilo_source,
         "fv_export_regime":      form.get("fv_export_regime", "nessuno"),
     }
+
+    # user_constraints — Brief 6
+    uc = form.get("user_constraints")
+    if uc and uc.get("type") and uc.get("scope"):
+        pv["user_constraints"] = {
+            "type":           uc["type"],
+            "scope":          uc["scope"],
+            "annual_value":   uc.get("annual_value"),
+            "monthly_values": uc.get("monthly_values"),
+        }
+
+    return pv
 
 
 def _build_data_quality(sdi: dict, macro_case: str, quality_level: int) -> dict:

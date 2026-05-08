@@ -91,6 +91,14 @@ def _make_toninato_state() -> SiteEnergyState:
     )
 
 
+def _make_toninato_constrained(**user_kwargs) -> SiteEnergyState:
+    """Toninato base con campi user_* aggiuntivi per test modalità vincolate."""
+    state = _make_toninato_state()
+    for k, v in user_kwargs.items():
+        setattr(state, k, v)
+    return state
+
+
 # ── Test 1 — Smoke test ───────────────────────────────────────────────────────
 
 def test_1_import_and_default_construction():
@@ -175,29 +183,51 @@ def test_3_toninato_validation():
     )
 
 
-# ── Test 4 — Vincoli utente → NotImplementedError ────────────────────────────
+# ── Test 4 — Modalità vincolata annua ────────────────────────────────────────
 
-def test_4_user_constraints_raise_not_implemented():
-    """Se user_autoconsumo_pct_annuo è impostato deve alzare NotImplementedError."""
-    state = SiteEnergyState(
-        prelievo_f1_mensile=[1000.0] * 12,
-        prelievo_f2_mensile=[500.0]  * 12,
-        prelievo_f3_mensile=[800.0]  * 12,
-        picchi_mensili_kw=[50.0]     * 12,
-        user_autoconsumo_pct_annuo=65.0,
+def test_4_constrained_annual_pct():
+    """Vincolo % autoconsumo annuo: mode corretto, source user_input, errore < 5%."""
+    state = _make_toninato_constrained(user_autoconsumo_pct_annuo=65.0)
+    state = reconcile(state)
+
+    assert state.reconcile_mode == "constrained_annual"
+    assert state.autoconsumo_fv_annuo_kwh.source == "user_input"
+    assert state.fabbisogno_annuo_kwh.source == "derived"
+
+    expected_ac = 65.0 / 100.0 * _TARGET_FV
+    actual_ac   = state.autoconsumo_fv_annuo_kwh.value
+    err = abs(actual_ac - expected_ac) / expected_ac
+    assert err < 0.05, (
+        f"Autoconsumo vincolato err {err*100:.1f}% > 5% "
+        f"(atteso={expected_ac:,.0f}, ottenuto={actual_ac:,.0f} kWh)"
     )
-    with pytest.raises(NotImplementedError):
-        reconcile(state)
 
 
-def test_4b_user_surplus_raises_not_implemented():
-    """Se user_surplus_kwh_annuo è impostato deve alzare NotImplementedError."""
-    state = SiteEnergyState(
-        prelievo_f1_mensile=[1000.0] * 12,
-        user_surplus_kwh_annuo=5000.0,
+def test_4b_constrained_annual_surplus():
+    """Vincolo kWh surplus annuo: autoconsumo = FV - surplus, identità di bilancio rispettata."""
+    state = _make_toninato_constrained(user_surplus_kwh_annuo=33_000.0)
+    state = reconcile(state)
+
+    assert state.reconcile_mode == "constrained_annual"
+    assert state.autoconsumo_fv_annuo_kwh.source == "user_input"
+
+    expected_ac = _TARGET_FV - 33_000.0
+    actual_ac   = state.autoconsumo_fv_annuo_kwh.value
+    err = abs(actual_ac - expected_ac) / expected_ac
+    assert err < 0.05, (
+        f"AC da surplus err {err*100:.1f}% > 5% "
+        f"(atteso={expected_ac:,.0f}, ottenuto={actual_ac:,.0f} kWh)"
     )
-    with pytest.raises(NotImplementedError):
-        reconcile(state)
+
+    # Identità di bilancio
+    prelievo_ann = (sum(state.prelievo_f1_mensile)
+                    + sum(state.prelievo_f2_mensile)
+                    + sum(state.prelievo_f3_mensile))
+    expected_fabb = prelievo_ann + actual_ac
+    assert abs(state.fabbisogno_annuo_kwh.value - expected_fabb) < 100, (
+        f"Identità fabb={state.fabbisogno_annuo_kwh.value:,.0f} "
+        f"≠ prelievo+ac={expected_fabb:,.0f}"
+    )
 
 
 # ── Test 5 — Identità di bilancio ────────────────────────────────────────────
@@ -315,3 +345,88 @@ def test_8_diagnostics_populated():
     # Calibration loss presente
     assert state.calibration_loss is not None
     assert state.calibration_loss >= 0.0
+
+
+# ── Test 9 — Modalità vincolata mensile ──────────────────────────────────────
+
+def test_9_constrained_monthly_pct():
+    """Vincolo % autoconsumo mensile: mode, source, e ogni mese entro 1 kWh dal target."""
+    pct_mensili = [70.0, 70.0, 65.0, 60.0, 55.0, 50.0,
+                   50.0, 55.0, 60.0, 65.0, 70.0, 70.0]
+    state = _make_toninato_constrained(user_autoconsumo_pct_mensile=pct_mensili)
+    state = reconcile(state)
+
+    assert state.reconcile_mode == "constrained_monthly"
+    assert state.autoconsumo_fv_mensile_kwh[0].source == "user_input"
+    assert state.autoconsumo_fv_annuo_kwh.source == "user_input"
+    assert state.fabbisogno_annuo_kwh.source == "derived"
+
+    fv_mens = state.fv_mensile_pvgis_kwh
+    for m in range(12):
+        expected = pct_mensili[m] / 100.0 * fv_mens[m]
+        actual   = state.autoconsumo_fv_mensile_kwh[m].value
+        assert abs(actual - expected) < 1.0, (
+            f"Mese {m+1}: atteso={expected:.1f}, ottenuto={actual:.1f} kWh"
+        )
+
+
+# ── Test 10 — Vincolo impossibile: saturazione ───────────────────────────────
+
+def test_10_impossible_constraint_saturates():
+    """Surplus dichiarato > FV prodotto: autoconsumo saturato a 0 con warning."""
+    state = _make_toninato_constrained(user_surplus_kwh_annuo=120_000.0)
+    state = reconcile(state)
+
+    assert state.autoconsumo_fv_annuo_kwh.value == pytest.approx(0.0, abs=100)
+    assert any("saturat" in w.lower() for w in state.assumptions_active), (
+        f"Warning saturazione assente. Assumptions: {state.assumptions_active}"
+    )
+
+
+# ── Test 11 — Vincoli mutuamente esclusivi ────────────────────────────────────
+
+def test_11_mutually_exclusive_raises():
+    """Autoconsumo% e surplus kWh simultaneamente → ValueError."""
+    state = _make_toninato_constrained(
+        user_autoconsumo_pct_annuo=65.0,
+        user_surplus_kwh_annuo=20_000.0,
+    )
+    with pytest.raises(ValueError, match="mutuamente esclusivi"):
+        reconcile(state)
+
+
+# ── Test 12 — Vincolo mensile parziale → errore ───────────────────────────────
+
+def test_12_partial_monthly_raises():
+    """Lista mensile con < 12 elementi → ValueError."""
+    state = _make_toninato_constrained(
+        user_autoconsumo_pct_mensile=[70.0] * 6,  # solo 6 mesi
+    )
+    with pytest.raises(ValueError, match="tutti e 12"):
+        reconcile(state)
+
+
+# ── Test 13 — Identità di bilancio in tutti i mode ───────────────────────────
+
+@pytest.mark.parametrize("user_kwargs", [
+    {"user_autoconsumo_pct_annuo": 65.0},
+    {"user_autoconsumo_pct_mensile": [70.0] * 12},
+])
+def test_13_balance_identity_constrained_modes(user_kwargs):
+    """
+    Nei modi vincolati: fabbisogno = prelievo_bolletta + autoconsumo (hard enforcement, < 100 kWh).
+    Per il modo auto l'identità è approssimata (coperta da test_5); qui si testa solo constrained.
+    """
+    state = _make_toninato_constrained(**user_kwargs)
+    state = reconcile(state)
+
+    prelievo_ann = (sum(state.prelievo_f1_mensile)
+                    + sum(state.prelievo_f2_mensile)
+                    + sum(state.prelievo_f3_mensile))
+    ac   = state.autoconsumo_fv_annuo_kwh.value
+    fabb = state.fabbisogno_annuo_kwh.value
+
+    assert abs(fabb - (prelievo_ann + ac)) < 100, (
+        f"mode={state.reconcile_mode}: "
+        f"fabb={fabb:,.0f} ≠ prelievo+ac={prelievo_ann+ac:,.0f} kWh"
+    )

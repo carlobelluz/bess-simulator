@@ -109,12 +109,20 @@ def generate_profiles(sdi: dict, base_dir: str = ".") -> tuple[dict, list[str]]:
         )
 
     if state.has_fv and state.fabbisogno_annuo_kwh:
-        warnings.append(
-            f"Consumo sito ricostruito da prelievo bolletta + autoconsumo FV stimato. "
-            f"Fabbisogno annuo stimato: {state.fabbisogno_annuo_kwh.value:,.0f} kWh "
-            f"(autoconsumo FV: {state.autoconsumo_fv_annuo_kwh.value:,.0f} kWh, "
-            f"surplus FV: {state.surplus_fv_annuo_kwh.value:,.0f} kWh)."
-        )
+        if state.reconcile_mode in ("constrained_annual", "constrained_monthly"):
+            warnings.append(
+                f"Modalità vincolata ({state.reconcile_mode}): autoconsumo dichiarato dall'utente. "
+                f"Fabbisogno annuo: {state.fabbisogno_annuo_kwh.value:,.0f} kWh "
+                f"(autoconsumo: {state.autoconsumo_fv_annuo_kwh.value:,.0f} kWh, "
+                f"surplus: {state.surplus_fv_annuo_kwh.value:,.0f} kWh)."
+            )
+        else:
+            warnings.append(
+                f"Consumo sito ricostruito da prelievo bolletta + autoconsumo FV stimato. "
+                f"Fabbisogno annuo stimato: {state.fabbisogno_annuo_kwh.value:,.0f} kWh "
+                f"(autoconsumo FV: {state.autoconsumo_fv_annuo_kwh.value:,.0f} kWh, "
+                f"surplus FV: {state.surplus_fv_annuo_kwh.value:,.0f} kWh)."
+            )
 
     # 8. Aggiorna sdi["site"]["consumo_annuo_kwh"] per Case B con il fabbisogno ricostruito.
     # (spostato da case_builder.py a qui per tenere il valore in un unico posto)
@@ -185,6 +193,23 @@ def _sdi_to_site_energy_state(sdi: dict, base_dir: str):
     anno_rif  = _extract_reference_year(billing)
     quota_pot = float(_v_nested(sdi, "tariff_context", "quota_potenza_eur_kw_mese", default=0.0))
 
+    # Estrai vincoli utente dal SDI (Brief 6)
+    constraints = (sdi.get("pv_existing") or {}).get("user_constraints") or {}
+    ctype  = constraints.get("type")
+    cscope = constraints.get("scope")
+    user_ac_pct_annuo    = None
+    user_ac_pct_mensile  = None
+    user_sup_kwh_annuo   = None
+    user_sup_kwh_mensile = None
+    if ctype == "autoconsumo_pct" and cscope == "annuo":
+        user_ac_pct_annuo = float(constraints.get("annual_value") or 0)
+    elif ctype == "autoconsumo_pct" and cscope == "mensile":
+        user_ac_pct_mensile = [float(v) for v in constraints.get("monthly_values") or [0] * 12]
+    elif ctype == "surplus_kwh" and cscope == "annuo":
+        user_sup_kwh_annuo = float(constraints.get("annual_value") or 0)
+    elif ctype == "surplus_kwh" and cscope == "mensile":
+        user_sup_kwh_mensile = [float(v) for v in constraints.get("monthly_values") or [0] * 12]
+
     return SiteEnergyState(
         prelievo_f1_mensile=f1_m,
         prelievo_f2_mensile=f2_m,
@@ -198,6 +223,10 @@ def _sdi_to_site_energy_state(sdi: dict, base_dir: str):
         fv_oraria_pvgis_kw=fv_oraria_kw,
         fv_mensile_pvgis_kwh=fv_mensile_kwh,
         anno_riferimento=anno_rif,
+        user_autoconsumo_pct_annuo=user_ac_pct_annuo,
+        user_autoconsumo_pct_mensile=user_ac_pct_mensile,
+        user_surplus_kwh_annuo=user_sup_kwh_annuo,
+        user_surplus_kwh_mensile=user_sup_kwh_mensile,
     )
 
 
@@ -459,6 +488,11 @@ def _load_meta_from_state(state) -> dict:
         ),
         "archetype_inferred": state.archetype_inferred,
         "assumptions_active": state.assumptions_active,
+        "reconcile_mode":     state.reconcile_mode,
+        "autoconsumo_source": (
+            state.autoconsumo_fv_annuo_kwh.source
+            if state.autoconsumo_fv_annuo_kwh else "estimated"
+        ),
     }
 
 

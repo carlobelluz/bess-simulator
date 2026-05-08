@@ -264,6 +264,14 @@ def _render_sdi_diagnostic(sdi: dict) -> None:
             f"source: {consumo_billing.get('source', '—')} · "
             f"conf: {consumo_billing.get('confidence', '—')}"
         )
+        if has_pv:
+            _ac_kwh = load_meta.get("autoconsumo_fv_annuo_kwh")
+            _ac_src = load_meta.get("autoconsumo_source", "estimated")
+            _ac_label = "(dichiarato dall'utente)" if _ac_src == "user_input" else "(stimato)"
+            if _ac_kwh is not None:
+                st.markdown(
+                    f"**Autoconsumo FV:**  \n{_ac_kwh:,.0f} kWh {_ac_label}"
+                )
 
     with c3:
         st.markdown(f"**Profilo carico:**  \n`{load_meta.get('source', 'N/D')}`")
@@ -2686,6 +2694,113 @@ def _page_block1_intake() -> None:
             sc3.metric("Potenza di picco", f"{_s_peak_kw:.2f} kW")
             st.caption("⚪ stimato — forma sintetica da totali mensili PVGIS")
 
+            # ── Expander: vincoli utente autoconsumo (Brief 6) ────────────────
+            with st.expander("Hai dati specifici sull'autoconsumo?", expanded=False):
+                st.caption(
+                    "Se il cliente ha un'app PV plant o un report GSE con dati di "
+                    "autoconsumo o energia immessa in rete, inseriscili qui per "
+                    "migliorare la ricostruzione del modello."
+                )
+                _uc_type = st.radio(
+                    "Tipo di dato disponibile",
+                    options=["Nessuno", "% di autoconsumo FV", "kWh immessi in rete"],
+                    index=0,
+                    horizontal=True,
+                    key="uc_type_radio",
+                )
+                _user_constraints = None
+
+                if _uc_type == "% di autoconsumo FV":
+                    _uc_scope = st.radio(
+                        "Granularità",
+                        options=["Annuo", "Mensile (tutti e 12)"],
+                        index=0,
+                        horizontal=True,
+                        key="uc_pct_scope",
+                    )
+                    if _uc_scope == "Annuo":
+                        _pct_ann = st.number_input(
+                            "% autoconsumo annuo",
+                            min_value=0.0, max_value=100.0,
+                            value=65.0, step=1.0,
+                            help="Percentuale di FV prodotto consumato in loco (vs. immesso in rete)",
+                            key="uc_pct_ann",
+                        )
+                        _user_constraints = {
+                            "type": "autoconsumo_pct",
+                            "scope": "annuo",
+                            "annual_value": _pct_ann,
+                            "monthly_values": None,
+                        }
+                    else:
+                        st.caption("Inserisci la % di autoconsumo per ciascun mese.")
+                        _uc_cols1 = st.columns(6)
+                        _uc_cols2 = st.columns(6)
+                        _mesi_lab = ["Gen","Feb","Mar","Apr","Mag","Giu",
+                                     "Lug","Ago","Set","Ott","Nov","Dic"]
+                        _pct_monthly = []
+                        for _m in range(12):
+                            _col = _uc_cols1[_m % 6] if _m < 6 else _uc_cols2[_m % 6]
+                            with _col:
+                                _pct_monthly.append(st.number_input(
+                                    _mesi_lab[_m], min_value=0.0, max_value=100.0,
+                                    value=65.0, step=1.0, key=f"uc_pct_m{_m}",
+                                ))
+                        _user_constraints = {
+                            "type": "autoconsumo_pct",
+                            "scope": "mensile",
+                            "annual_value": None,
+                            "monthly_values": _pct_monthly,
+                        }
+
+                elif _uc_type == "kWh immessi in rete":
+                    _uc_scope2 = st.radio(
+                        "Granularità",
+                        options=["Annuo", "Mensile (tutti e 12)"],
+                        index=0,
+                        horizontal=True,
+                        key="uc_sup_scope",
+                    )
+                    if _uc_scope2 == "Annuo":
+                        _sup_ann = st.number_input(
+                            "kWh immessi in rete (annuo)",
+                            min_value=0.0, max_value=1_000_000.0,
+                            value=20_000.0, step=1000.0,
+                            help="Energia FV ceduta alla rete (non autoconsumata)",
+                            key="uc_sup_ann",
+                        )
+                        _user_constraints = {
+                            "type": "surplus_kwh",
+                            "scope": "annuo",
+                            "annual_value": _sup_ann,
+                            "monthly_values": None,
+                        }
+                    else:
+                        st.caption("Inserisci i kWh immessi in rete per ciascun mese.")
+                        _uc_cols3 = st.columns(6)
+                        _uc_cols4 = st.columns(6)
+                        _sup_monthly = []
+                        for _m in range(12):
+                            _col = _uc_cols3[_m % 6] if _m < 6 else _uc_cols4[_m % 6]
+                            with _col:
+                                _sup_monthly.append(st.number_input(
+                                    f"{_mesi_lab[_m]} kWh",
+                                    min_value=0.0, max_value=200_000.0,
+                                    value=2_000.0, step=100.0,
+                                    key=f"uc_sup_m{_m}",
+                                ))
+                        _user_constraints = {
+                            "type": "surplus_kwh",
+                            "scope": "mensile",
+                            "annual_value": None,
+                            "monthly_values": _sup_monthly,
+                        }
+
+                if _user_constraints:
+                    st.session_state["intake_user_constraints"] = _user_constraints
+                else:
+                    st.session_state.pop("intake_user_constraints", None)
+
         else:
             st.info(
                 "Inserisci la potenza FV e clicca 'Calcola produzione FV con PVGIS →' "
@@ -3015,6 +3130,7 @@ def _page_block1_intake() -> None:
         "f1_kwh":                    _safe_sum("f1_kwh"),
         "f2_kwh":                    _safe_sum("f2_kwh"),
         "f3_kwh":                    _safe_sum("f3_kwh"),
+        "user_constraints":          st.session_state.get("intake_user_constraints"),
     }
 
     # ── Block 1: SDI + Diagnostica ────────────────────────────────────────────
