@@ -1,4 +1,5 @@
 numpy>=1.26
+scipy>=1.12
 numpy-financial>=1.0
 pandas>=2.0
 streamlit>=1.35
