@@ -10,9 +10,12 @@ Public API:
       Returns arrays from cache, or None if cache file is missing.
 
 Supported macro-cases:
-  A — synthetic load, zeros PV
-  B — temporal matching reconstruction (binary search)
+  A — reconcile on synthetic F1/F2/F3 derived from annual consumption
+  B — reconcile on real monthly F1/F2/F3 + peaks from billing
   C/D — NotImplementedError (CSV upload not yet implemented)
+
+Internal engine: site_reconstruction.reconcile() — the only source of truth
+for load profiles and self-consumption calculations.
 """
 
 from __future__ import annotations
@@ -23,13 +26,9 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-# Ensure project root is on sys.path so `engine` is importable
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
-
-from engine.profile_builder import build_all_profiles
-from intake.tariff_bands import build_band_masks, validate_band_reconstruction
 
 _SLOT_H = 0.25
 
@@ -57,32 +56,80 @@ def generate_profiles(sdi: dict, base_dir: str = ".") -> tuple[dict, list[str]]:
             "non è ancora implementato in Block 1."
         )
 
-    pb_case = _sdi_to_pb_case(sdi)
+    # 1. Traduci sdi → SiteEnergyState
+    state = _sdi_to_site_energy_state(sdi, base_dir)
 
-    if macro_case == "B":
-        profiles, load_meta, recon_warnings = _reconstruct_case_b(pb_case, sdi, base_dir)
-        warnings.append(
-            "Case B: consumo sito ricostruito da prelievo netto bolletta + stima profilo FV. "
-            "Accuratezza indicativa ±30–40%."
-        )
-        warnings.extend(recon_warnings)
-    else:
-        # Case A (and any future extension): standard synthetic path
-        profiles = build_all_profiles(pb_case, base_dir)
-        load_meta = _load_meta_case_a(pb_case)
+    # 2. Riconcilia — unico motore di calcolo del profilo
+    from intake.site_reconstruction import reconcile
+    state = reconcile(state)
 
-    # Save cache
+    # 3. Profilo prezzi (motore invariato)
+    price_qh = _build_price_profile(sdi, base_dir)
+
+    # 4. Metadati temporali per il cache
+    time_arrays = _build_time_index_arrays(state.anno_riferimento)
+
+    # 5. Salva cache nel formato atteso da load_profiles() e case_builder
     cache_rel = f"profiles_cache/{case_id}_profiles.json"
     cache_abs = os.path.join(base_dir, cache_rel)
     os.makedirs(os.path.dirname(cache_abs), exist_ok=True)
-    _save_cache(profiles, case_id, cache_abs)
+    _save_cache(
+        {
+            "load_kw":       state.load_profile_qh_kw,
+            "pv_kw":         state.fv_profile_qh_kw,
+            "price_eur_kwh": price_qh,
+            **time_arrays,
+            "slot_hours": 0.25,
+            "n_slots":    35040,
+        },
+        case_id,
+        cache_abs,
+    )
 
+    # 6. Sezione metadata nel formato che case_builder si aspetta
     profiles_section = {
         "cache_file":    cache_rel,
-        "load_kw":       load_meta,
-        "pv_kw":         _pv_meta(sdi, pb_case),
+        "load_kw":       _load_meta_from_state(state),
+        "pv_kw":         _pv_meta(sdi),
         "price_eur_kwh": _price_meta(sdi, base_dir),
     }
+
+    # 7. Warning diagnostici
+    avg_err = _avg_band_error(state)
+    if state.overall_confidence == "low":
+        warnings.append(
+            f"Ricostruzione carico a confidenza bassa "
+            f"(archetipo: {state.archetype_inferred}, "
+            f"errore F1/F2/F3 medio: {avg_err:.1f}%)."
+        )
+    elif state.overall_confidence == "medium":
+        warnings.append(
+            f"Ricostruzione carico a confidenza media. "
+            f"Archetipo inferito: {state.archetype_inferred}."
+        )
+
+    if state.has_fv and state.fabbisogno_annuo_kwh:
+        warnings.append(
+            f"Consumo sito ricostruito da prelievo bolletta + autoconsumo FV stimato. "
+            f"Fabbisogno annuo stimato: {state.fabbisogno_annuo_kwh.value:,.0f} kWh "
+            f"(autoconsumo FV: {state.autoconsumo_fv_annuo_kwh.value:,.0f} kWh, "
+            f"surplus FV: {state.surplus_fv_annuo_kwh.value:,.0f} kWh)."
+        )
+
+    # 8. Aggiorna sdi["site"]["consumo_annuo_kwh"] per Case B con il fabbisogno ricostruito.
+    # (spostato da case_builder.py a qui per tenere il valore in un unico posto)
+    if macro_case == "B" and state.fabbisogno_annuo_kwh:
+        sdi["site"]["consumo_annuo_kwh"] = {
+            "value":      round(state.fabbisogno_annuo_kwh.value),
+            "source":     "reconstructed_from_bill_and_pv",
+            "confidence": state.overall_confidence or "low",
+            "note": (
+                f"Fabbisogno energetico del sito ricostruito da bolletta + FV. "
+                f"Include autoconsumo FV "
+                f"({state.autoconsumo_fv_annuo_kwh.value:,.0f} kWh) "
+                f"oltre al prelievo netto da bolletta."
+            ),
+        }
 
     return profiles_section, warnings
 
@@ -107,244 +154,225 @@ def load_profiles(sdi: dict, base_dir: str = ".") -> dict | None:
     }
 
 
-# ── Case B reconstruction ──────────────────────────────────────────────────────
+# ── SDI → SiteEnergyState translation ─────────────────────────────────────────
 
-def _reconstruct_case_b(
-    pb_case: dict, sdi: dict, base_dir: str
-) -> tuple[dict, dict, list[str]]:
-    """
-    Temporal matching reconstruction for Case B (existing PV, no real curve).
+def _sdi_to_site_energy_state(sdi: dict, base_dir: str):
+    """Estrae i dati dal sdi e costruisce un SiteEnergyState per reconcile()."""
+    from intake.site_reconstruction import SiteEnergyState
 
-    Algorithm:
-      1. Call build_all_profiles to get the synthetic load shape and PV profile.
-         The load is initially scaled to consumo_netto (net grid draw from billing),
-         which is used as the seed shape — magnitude will be corrected in step 3.
-      2. Binary-search for scaling factor k such that:
-             Σ max(0, k·load_raw[t] − pv[t]) × 0.25h = consumo_netto_bolletta
-      3. Override load_kw = k × load_raw.
-      4. If billing F1/F2/F3 values are present: validate the reconstructed
-         per-band grid draw against billed values and update confidence accordingly.
-
-    Returns (profiles_dict, load_meta_dict, extra_warnings_list).
-    """
-    consumo_netto   = _get_consumo_netto(sdi)
-    extra_warnings: list[str] = []
-
-    # Single build_all_profiles call: gets load shape + PV + price + time index
-    full     = build_all_profiles(pb_case, base_dir)
-    load_raw = full["load_kw"]  # scaled to consumo_netto (good seed shape)
-    pv_kw    = full["pv_kw"]
-
-    # Binary search for k
-    k = _find_k_bisect(load_raw, pv_kw, consumo_netto)
-
-    # Override load_kw with reconstructed version
-    full["load_kw"] = k * load_raw
-
-    load_meta = {
-        "source":        "reconstructed_from_bill_and_pv",
-        "confidence":    "low",
-        "f1f2f3_used":   False,
-        "method_note": (
-            f"Temporal matching: fattore k={k:.4f} × load sintetico. "
-            f"Target prelievo netto da bolletta: {consumo_netto:,.0f} kWh/anno. "
-            f"Consumo sito ricostruito: {k * consumo_netto:,.0f} kWh/anno."
-        ),
-        "accuracy_note": "Accuratezza indicativa ±30–40%. Consumo sito include autoconsumo FV.",
-    }
-
-    # F1/F2/F3 band validation (if available from billing)
     billing = sdi.get("billing") or {}
-    f1 = _get_band_kwh(billing, "f1_kwh")
-    f2 = _get_band_kwh(billing, "f2_kwh")
-    f3 = _get_band_kwh(billing, "f3_kwh")
+    site    = sdi.get("site")    or {}
+    pv_ex   = sdi.get("pv_existing") or {}
 
-    # Annualize: billing stores raw sum across n bills (same logic as consumo_annuo)
-    if f1 is not None and f2 is not None and f3 is not None:
-        n_bills = billing.get("n_bills", 0)
+    # F1/F2/F3 mensili
+    f1_m, f2_m, f3_m = _extract_monthly_bands(billing)
+
+    # Picchi mensili
+    picchi_m = _extract_monthly_peaks(billing, site)
+
+    # FV
+    has_fv = bool(pv_ex.get("presente", False)) and _v(pv_ex.get("kwp"), 0) > 0
+    fv_kwp     = float(_v(pv_ex.get("kwp"), 0)) if has_fv else 0.0
+    fv_tilt    = float(_v(pv_ex.get("tilt"), 30)) if has_fv else 30.0
+    fv_azimuth = float(_v(pv_ex.get("azimuth"), 0)) if has_fv else 0.0
+
+    fv_oraria_kw   = None
+    fv_mensile_kwh = None
+    if has_fv:
+        fv_oraria_kw   = _load_or_build_fv_hourly(sdi, base_dir, fv_kwp, fv_tilt, fv_azimuth)
+        fv_mensile_kwh = _monthly_from_hourly(fv_oraria_kw)
+
+    anno_rif  = _extract_reference_year(billing)
+    quota_pot = float(_v_nested(sdi, "tariff_context", "quota_potenza_eur_kw_mese", default=0.0))
+
+    return SiteEnergyState(
+        prelievo_f1_mensile=f1_m,
+        prelievo_f2_mensile=f2_m,
+        prelievo_f3_mensile=f3_m,
+        picchi_mensili_kw=picchi_m,
+        quota_potenza_eur_kw_mese=quota_pot,
+        has_fv=has_fv,
+        fv_kwp=fv_kwp,
+        fv_tilt=fv_tilt,
+        fv_azimuth=fv_azimuth,
+        fv_oraria_pvgis_kw=fv_oraria_kw,
+        fv_mensile_pvgis_kwh=fv_mensile_kwh,
+        anno_riferimento=anno_rif,
+    )
+
+
+def _extract_monthly_bands(
+    billing: dict,
+) -> tuple[list[float], list[float], list[float]]:
+    """
+    Estrae i prelievi mensili F1/F2/F3 dal billing dict.
+
+    Priorità:
+    1. mensili_per_fascia (per-month breakdown da bollette)
+    2. Aggregati annuali f1_kwh, f2_kwh, f3_kwh distribuiti su 12 mesi
+    3. consumo_annuo_derivato_kwh con split tipico industriale 50/25/25
+    """
+    f1 = [0.0] * 12
+    f2 = [0.0] * 12
+    f3 = [0.0] * 12
+
+    # Try 1: mensili_per_fascia
+    fascia = billing.get("mensili_per_fascia") or []
+    if fascia and isinstance(fascia, list):
+        for entry in fascia:
+            if not isinstance(entry, dict):
+                continue
+            m = entry.get("mese")
+            if m is None:
+                continue
+            try:
+                m_idx = int(m) - 1
+                if not (0 <= m_idx < 12):
+                    continue
+                f1[m_idx] = float(entry.get("f1_kwh") or 0.0)
+                f2[m_idx] = float(entry.get("f2_kwh") or 0.0)
+                f3[m_idx] = float(entry.get("f3_kwh") or 0.0)
+            except (TypeError, ValueError):
+                continue
+        if any(f1) or any(f2) or any(f3):
+            return f1, f2, f3
+
+    # Try 2: aggregati annuali → distribuzione uniforme
+    f1_tot = float(billing.get("f1_kwh") or 0.0)
+    f2_tot = float(billing.get("f2_kwh") or 0.0)
+    f3_tot = float(billing.get("f3_kwh") or 0.0)
+
+    if f1_tot + f2_tot + f3_tot > 0:
+        n_bills = int(billing.get("n_bills") or 0)
         if 0 < n_bills < 12:
             factor = 12.0 / n_bills
-            f1, f2, f3 = f1 * factor, f2 * factor, f3 * factor
+            f1_tot *= factor
+            f2_tot *= factor
+            f3_tot *= factor
+        return [f1_tot / 12.0] * 12, [f2_tot / 12.0] * 12, [f3_tot / 12.0] * 12
 
-    if f1 is not None and f2 is not None and f3 is not None:
-        year  = _infer_profile_year(len(full["load_kw"]))
-        masks = build_band_masks(year)
-        confidence, band_warning, band_draws = validate_band_reconstruction(
-            full["load_kw"], pv_kw, masks, f1, f2, f3
-        )
-        load_meta["confidence"]     = confidence
-        load_meta["f1f2f3_used"]    = True
-        load_meta["band_draws_kwh"] = band_draws
-        if band_warning:
-            extra_warnings.append(band_warning)
-
-    return full, load_meta, extra_warnings
-
-
-def _find_k_bisect(
-    load_raw: np.ndarray,
-    pv_kw: np.ndarray,
-    target_kwh: float,
-    n_iter: int = 50,
-) -> float:
-    """
-    Returns k ≥ 1 such that sum(max(0, k·load_raw − pv_kw)) × 0.25h ≈ target_kwh.
-
-    k_lo = 1.0: when k=1, load_raw sums to target_kwh (profile_builder scaling).
-    With any PV, grid_draw(k=1) ≤ target_kwh → k > 1 for Case B.
-    k_hi starts at 4.0 and doubles until grid_draw(k_hi) > target_kwh.
-    """
-    if target_kwh <= 0:
-        return 1.0
-
-    def _grid(k: float) -> float:
-        return float(np.maximum(k * load_raw - pv_kw, 0.0).sum() * _SLOT_H)
-
-    k_lo = 1.0
-    k_hi = 4.0
-    while _grid(k_hi) < target_kwh:
-        k_hi *= 2.0
-        if k_hi > 200.0:
-            # PV is enormous relative to load — return best upper bound
-            return k_hi
-
-    for _ in range(n_iter):
-        k_mid = (k_lo + k_hi) / 2.0
-        if _grid(k_mid) < target_kwh:
-            k_lo = k_mid
-        else:
-            k_hi = k_mid
-
-    return (k_lo + k_hi) / 2.0
-
-
-def _get_consumo_netto(sdi: dict) -> float:
-    """Net grid draw from billing (target for Case B binary search)."""
-    annual = (sdi.get("billing") or {}).get("consumo_annuo_derivato_kwh") or {}
+    # Try 3: consumo_annuo con split tipico industriale 50/25/25
+    annual = billing.get("consumo_annuo_derivato_kwh") or {}
     if isinstance(annual, dict):
-        return float(annual.get("value") or 0.0)
-    return float(annual or 0.0)
+        annual_kwh = float(annual.get("value") or 0.0)
+    else:
+        annual_kwh = float(annual or 0.0)
+
+    if annual_kwh > 0:
+        return (
+            [annual_kwh * 0.50 / 12.0] * 12,
+            [annual_kwh * 0.25 / 12.0] * 12,
+            [annual_kwh * 0.25 / 12.0] * 12,
+        )
+
+    return f1, f2, f3
 
 
-def _get_band_kwh(billing: dict, key: str) -> float | None:
-    """Extracts a F1/F2/F3 value from billing dict. Returns None if missing or zero."""
-    v = billing.get(key)
-    if v is None:
-        return None
-    return float(v) if float(v) > 0 else None
+def _extract_monthly_peaks(billing: dict, site: dict) -> list[float]:
+    """Estrae picchi mensili kW da billing o usa il picco di sito come fallback."""
+    peaks = [0.0] * 12
+
+    picchi = billing.get("picchi_mensili_kw") or []
+    if isinstance(picchi, list):
+        for entry in picchi:
+            if not isinstance(entry, dict):
+                continue
+            m = entry.get("mese")
+            if m is None:
+                continue
+            try:
+                m_idx = int(m) - 1
+                if not (0 <= m_idx < 12):
+                    continue
+                pk = entry.get("picco_kw")
+                if pk is not None:
+                    peaks[m_idx] = float(pk or 0.0)
+            except (TypeError, ValueError):
+                continue
+
+    if not any(peaks):
+        site_peak = float(_v(site.get("picco_potenza_kw"), 0) or 0.0)
+        if site_peak > 0:
+            peaks = [site_peak] * 12
+
+    return peaks
 
 
-def _infer_profile_year(n_slots: int) -> int:
+def _load_or_build_fv_hourly(
+    sdi: dict, base_dir: str, kwp: float, tilt: float, azimuth: float
+) -> np.ndarray:
     """
-    Infers a representative year for tariff-band masks from profile length.
-    35040 slots → 365 days → 2023 (non-leap).
-    35136 slots → 366 days → 2024 (leap).
-    Falls back to 2023 for any unexpected length.
+    Ritorna profilo FV orario (8760 valori, kW).
+    Usa build_pv_profile (engine.profile_builder) e aggrega da 35040 → 8760.
     """
-    if n_slots == 35136:
-        return 2024
-    return 2023
+    from engine.profile_builder import build_pv_profile, _make_time_index
 
+    pv_ex = sdi.get("pv_existing") or {}
+    site  = sdi.get("site")        or {}
 
-# ── SDI → profile_builder case format ─────────────────────────────────────────
-
-def _sdi_to_pb_case(sdi: dict) -> dict:
-    """
-    Translates a site_diagnostic_input dict into the profile_builder case format.
-
-    SDI fields follow the {value, source, confidence} pattern.
-    profile_builder expects plain scalar values.
-    pv_existing.presente and pv_existing.profilo_source are plain values (not wrapped).
-    pv_existing.kwp, .tilt, .azimuth are {value,...} objects.
-    """
-    def _v(field, default=None):
-        if isinstance(field, dict):
-            return field.get("value", default)
-        return field if field is not None else default
-
-    site_s   = sdi.get("site") or {}
-    op_s     = sdi.get("operational_profile") or {}
-    tariff_s = sdi.get("tariff_context") or {}
-    pv_ex    = sdi.get("pv_existing") or {}
-
-    has_pv = bool(pv_ex.get("presente")) and (_v(pv_ex.get("kwp"), 0) or 0) > 0
-
-    pb_site = {
-        "consumo_annuo_kwh":      _v(site_s.get("consumo_annuo_kwh"), 0),
-        "lat":                     _v(site_s.get("lat")),
-        "lon":                     _v(site_s.get("lon")),
-        "ore_lavoro_giorno":       _v(op_s.get("ore_lavoro_giorno"), 10),
-        "giorni_lavoro_settimana": _v(op_s.get("giorni_lavoro_settimana"), 5),
-    }
-
-    pb_pv = {
-        "presente":         has_pv,
-        "kwp":              _v(pv_ex.get("kwp"), 0) if has_pv else 0,
-        "profilo_source":   pv_ex.get("profilo_source", "sintetico") if has_pv else "sintetico",
-        "fv_export_regime": pv_ex.get("fv_export_regime", "nessuno") if has_pv else "nessuno",
+    pv_dict = {
+        "presente":         True,
+        "kwp":              kwp,
+        "profilo_source":   pv_ex.get("profilo_source", "sintetico"),
+        "fv_export_regime": pv_ex.get("fv_export_regime", "nessuno"),
         "pvgis_year":       2020,
-        "pvgis_tilt":       _v(pv_ex.get("tilt"), 30) if has_pv else 30,
-        "pvgis_azimuth":    _v(pv_ex.get("azimuth"), 0) if has_pv else 0,
+        "pvgis_tilt":       tilt,
+        "pvgis_azimuth":    azimuth,
         "pvgis_losses_pct": 14,
     }
-
-    pb_tariffs = {
-        "market_price_series":     _v(tariff_s.get("market_price_series"), ""),
-        "supplier_spread_eur_kwh": _v(tariff_s.get("supplier_spread_eur_kwh"), 0.0),
+    site_dict = {
+        "lat": _v(site.get("lat"), None),
+        "lon": _v(site.get("lon"), None),
     }
 
-    return {"site": pb_site, "pv": pb_pv, "tariffs": pb_tariffs}
+    ti       = _make_time_index()
+    pv_qh_kw = build_pv_profile(pv_dict, ti, site_dict, base_dir)   # 35040 slot
+
+    # Aggrega in orario: media dei 4 slot quartorari per ogni ora
+    pv_hourly = pv_qh_kw[:35040].reshape(8760, 4).mean(axis=1)
+    return pv_hourly
 
 
-# ── Metadata builders ──────────────────────────────────────────────────────────
-
-def _load_meta_case_a(pb_case: dict) -> dict:
-    site = pb_case["site"]
-    return {
-        "source":        "synthetic_industrial",
-        "confidence":    "low",
-        "method_note": (
-            f"Profilo sintetico industriale — "
-            f"{site['consumo_annuo_kwh']:,.0f} kWh/anno, "
-            f"{site.get('ore_lavoro_giorno', 10)}h/gg, "
-            f"{site.get('giorni_lavoro_settimana', 5)}gg/sett."
-        ),
-        "accuracy_note":  "Accuratezza indicativa ±40%.",
-        "f1f2f3_used":    False,
-    }
+def _monthly_from_hourly(fv_hourly_kw: np.ndarray) -> list[float]:
+    """
+    Calcola kWh mensili da un profilo orario (8760 valori, kW).
+    Anno non bisestile: 365 giorni, 8760 ore.
+    """
+    _days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    result = []
+    h = 0
+    for d in _days:
+        hours = d * 24
+        result.append(float(fv_hourly_kw[h: h + hours].sum()))   # kW × 1h = kWh
+        h += hours
+    return result
 
 
-def _pv_meta(sdi: dict, pb_case: dict) -> dict:
-    pv_ex = sdi.get("pv_existing") or {}
-    if not pv_ex.get("presente", False):
-        return {"source": "zeros", "confidence": "high", "pvgis_params": None}
+def _extract_reference_year(billing: dict) -> int:
+    """Inferisce l'anno di riferimento dai periodi coperti dalle bollette."""
+    mesi = billing.get("mesi_coperti") or []
+    if mesi and isinstance(mesi, list):
+        years = []
+        for p in mesi:
+            if isinstance(p, str) and len(p) >= 4:
+                try:
+                    years.append(int(p[:4]))
+                except ValueError:
+                    pass
+        if years:
+            return max(years)
 
-    profilo_source = pv_ex.get("profilo_source", "sintetico")
-    if profilo_source == "pvgis":
-        pv = pb_case["pv"]
-        site = pb_case["site"]
-        return {
-            "source":      "pvgis",
-            "confidence":  "medium",
-            "pvgis_params": {
-                "year":       pv.get("pvgis_year", 2020),
-                "tilt":       pv.get("pvgis_tilt", 30),
-                "azimuth":    pv.get("pvgis_azimuth", 0),
-                "losses_pct": pv.get("pvgis_losses_pct", 14),
-                "lat":        site.get("lat"),
-                "lon":        site.get("lon"),
-            },
-        }
-    return {"source": "synthetic", "confidence": "low", "pvgis_params": None}
+    from datetime import date
+    return date.today().year - 1
 
 
-def _price_meta(sdi: dict, base_dir: str) -> dict:
-    series = _v_nested(sdi, "tariff_context", "market_price_series", default="")
-    has_file = bool(series) and os.path.exists(os.path.join(base_dir, series))
-    if has_file:
-        label = os.path.splitext(os.path.basename(series))[0]  # e.g. "it_nord_2024"
-        return {"source": label, "series_file": series, "confidence": "high"}
-    return {"source": "synthetic_it_nord", "series_file": None, "confidence": "medium"}
+# ── Helpers di supporto ────────────────────────────────────────────────────────
+
+def _v(field, default=None):
+    """Unwraps {value,...} objects or returns the scalar directly."""
+    if isinstance(field, dict):
+        return field.get("value", default)
+    return field if field is not None else default
 
 
 def _v_nested(sdi: dict, *keys, default=None):
@@ -357,6 +385,120 @@ def _v_nested(sdi: dict, *keys, default=None):
         if isinstance(node, dict) and "value" in node:
             node = node["value"]
     return node if node is not None else default
+
+
+def _build_price_profile(sdi: dict, base_dir: str) -> np.ndarray:
+    """Costruisce il profilo prezzi usando engine.profile_builder."""
+    from engine.profile_builder import build_price_profile, _make_time_index
+
+    tariff_s = sdi.get("tariff_context") or {}
+    tariffs = {
+        "market_price_series":     _v(tariff_s.get("market_price_series"), ""),
+        "supplier_spread_eur_kwh": _v(tariff_s.get("supplier_spread_eur_kwh"), 0.0),
+    }
+    ti = _make_time_index()
+    return build_price_profile(tariffs, base_dir, ti)
+
+
+def _build_time_index_arrays(year: int) -> dict:
+    """Genera gli array di metadati temporali richiesti dal formato cache."""
+    from engine.profile_builder import _make_time_index
+    ti = _make_time_index()   # già 35040 slot, anno standard
+    return {
+        "month":       ti["month"],
+        "hour":        ti["hour"],
+        "dow":         ti["dow"],
+        "slot_in_day": ti["slot_in_day"],
+    }
+
+
+# ── Metadata builders ──────────────────────────────────────────────────────────
+
+def _load_meta_from_state(state) -> dict:
+    """Costruisce il dizionario metadata di load_kw dal SiteEnergyState."""
+    source = "reconstructed_from_bill_and_pv" if state.has_fv else "reconstructed_from_bill"
+
+    arch_label = {
+        "industrial_single_shift": "industriale singolo turno",
+        "industrial_double_shift": "industriale due turni",
+        "industrial_continuous":   "industriale continuo 24/7",
+        "commercial_office":       "commerciale/uffici",
+        "mixed":                   "carico misto",
+    }.get(state.archetype_inferred, state.archetype_inferred or "non determinato")
+
+    score_pct = f"{state.archetype_confidence_score:.0%}" if state.archetype_confidence_score else "n/d"
+    method_note = (
+        f"Profilo ricostruito via site_reconstruction.reconcile() in modalità auto. "
+        f"Archetipo inferito: {arch_label} (confidenza {score_pct}). "
+        f"Calibrazione su 36 vincoli (12 mesi × 3 fasce F1/F2/F3)."
+    )
+
+    avg_err = _avg_band_error(state)
+    accuracy_note = (
+        f"Errore medio sui prelievi modellati vs bolletta: {avg_err:.1f}%. "
+        f"Confidenza globale: {state.overall_confidence}."
+    )
+
+    return {
+        "source":        source,
+        "confidence":    state.overall_confidence or "low",
+        "method_note":   method_note,
+        "accuracy_note": accuracy_note,
+        "f1f2f3_used":   True,
+        "band_draws_kwh": state.band_match_error_pct,  # dict {f1, f2, f3} → errore %
+        "fabbisogno_annuo_kwh": (
+            state.fabbisogno_annuo_kwh.value if state.fabbisogno_annuo_kwh else None
+        ),
+        "autoconsumo_fv_annuo_kwh": (
+            state.autoconsumo_fv_annuo_kwh.value if state.autoconsumo_fv_annuo_kwh else None
+        ),
+        "surplus_fv_annuo_kwh": (
+            state.surplus_fv_annuo_kwh.value if state.surplus_fv_annuo_kwh else None
+        ),
+        "archetype_inferred": state.archetype_inferred,
+        "assumptions_active": state.assumptions_active,
+    }
+
+
+def _avg_band_error(state) -> float:
+    """Errore medio assoluto % su F1/F2/F3."""
+    if state.band_match_error_pct:
+        errs = [abs(state.band_match_error_pct.get(b, 0.0)) for b in ("f1", "f2", "f3")]
+        return float(np.mean(errs))
+    return 0.0
+
+
+def _pv_meta(sdi: dict) -> dict:
+    """Costruisce la sezione metadata pv_kw per profiles_section."""
+    pv_ex = sdi.get("pv_existing") or {}
+    if not pv_ex.get("presente", False):
+        return {"source": "zeros", "confidence": "high", "pvgis_params": None}
+
+    profilo_source = pv_ex.get("profilo_source", "sintetico")
+    if profilo_source == "pvgis":
+        site = sdi.get("site") or {}
+        return {
+            "source":      "pvgis",
+            "confidence":  "medium",
+            "pvgis_params": {
+                "year":       2020,
+                "tilt":       _v(pv_ex.get("tilt"), 30),
+                "azimuth":    _v(pv_ex.get("azimuth"), 0),
+                "losses_pct": 14,
+                "lat":        _v(site.get("lat"), None),
+                "lon":        _v(site.get("lon"), None),
+            },
+        }
+    return {"source": "synthetic", "confidence": "low", "pvgis_params": None}
+
+
+def _price_meta(sdi: dict, base_dir: str) -> dict:
+    series  = _v_nested(sdi, "tariff_context", "market_price_series", default="")
+    has_file = bool(series) and os.path.exists(os.path.join(base_dir, series))
+    if has_file:
+        label = os.path.splitext(os.path.basename(series))[0]
+        return {"source": label, "series_file": series, "confidence": "high"}
+    return {"source": "synthetic_it_nord", "series_file": None, "confidence": "medium"}
 
 
 # ── Cache helpers ──────────────────────────────────────────────────────────────
@@ -373,98 +515,3 @@ def _save_cache(profiles: dict, case_id: str, cache_abs: str) -> None:
             out[k] = v
     with open(cache_abs, "w") as f:
         json.dump(out, f)
-
-
-# ── Quick sanity test ──────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import tempfile, shutil
-
-    BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    TMP  = tempfile.mkdtemp()
-
-    # Create profiles_cache inside tmp
-    os.makedirs(os.path.join(TMP, "profiles_cache"), exist_ok=True)
-    # Symlink prices/ and pvgis_cache/ so the engine can find them
-    for subdir in ("prices", "pvgis_cache", "engine"):
-        src = os.path.join(BASE, subdir)
-        dst = os.path.join(TMP, subdir)
-        if os.path.exists(src) and not os.path.exists(dst):
-            os.symlink(src, dst)
-
-    # ── Test A ────────────────────────────────────────────────────────────────
-    sdi_a = {
-        "meta":    {"case_id": "test_a", "macro_case": "A"},
-        "site":    {"consumo_annuo_kwh": {"value": 200_000}},
-        "operational_profile": {
-            "ore_lavoro_giorno":       {"value": 10},
-            "giorni_lavoro_settimana": {"value": 5},
-        },
-        "billing": {"consumo_annuo_derivato_kwh": {"value": 200_000}},
-        "tariff_context": {
-            "market_price_series":     {"value": "prices/it_nord_2024.json"},
-            "supplier_spread_eur_kwh": {"value": 0.05},
-        },
-        "pv_existing": None,
-    }
-
-    meta_a, warns_a = generate_profiles(sdi_a, base_dir=TMP)
-    cached_a = load_profiles({"profiles": meta_a}, base_dir=TMP)
-
-    load_sum_a = cached_a["load_kw"].sum() * _SLOT_H
-    pv_sum_a   = cached_a["pv_kw"].sum() * _SLOT_H
-
-    print("=== Test A ===")
-    print(f"  load sum : {load_sum_a:,.0f} kWh  (atteso ~200,000)")
-    print(f"  pv sum   : {pv_sum_a:,.0f} kWh  (atteso 0)")
-    print(f"  source   : {meta_a['load_kw']['source']}")
-    print(f"  warnings : {warns_a}")
-    assert abs(load_sum_a - 200_000) < 1, f"load sum mismatch: {load_sum_a}"
-    assert pv_sum_a == 0.0, f"PV non zero in Case A: {pv_sum_a}"
-    print("  OK\n")
-
-    # ── Test B ────────────────────────────────────────────────────────────────
-    sdi_b = {
-        "meta":    {"case_id": "test_b", "macro_case": "B"},
-        "site": {
-            "consumo_annuo_kwh": {"value": 150_000},
-            "lat":               {"value": None},
-            "lon":               {"value": None},
-        },
-        "operational_profile": {
-            "ore_lavoro_giorno":       {"value": 10},
-            "giorni_lavoro_settimana": {"value": 5},
-        },
-        "billing": {"consumo_annuo_derivato_kwh": {"value": 150_000}},
-        "tariff_context": {
-            "market_price_series":     {"value": "prices/it_nord_2024.json"},
-            "supplier_spread_eur_kwh": {"value": 0.05},
-        },
-        "pv_existing": {
-            "presente":       True,
-            "kwp":            {"value": 80},
-            "profilo_source": "sintetico",
-        },
-    }
-
-    meta_b, warns_b = generate_profiles(sdi_b, base_dir=TMP)
-    cached_b = load_profiles({"profiles": meta_b}, base_dir=TMP)
-
-    load_sum_b = cached_b["load_kw"].sum() * _SLOT_H
-    pv_sum_b   = cached_b["pv_kw"].sum() * _SLOT_H
-    grid_sum_b = float(
-        np.maximum(cached_b["load_kw"] - cached_b["pv_kw"], 0.0).sum() * _SLOT_H
-    )
-
-    print("=== Test B ===")
-    print(f"  load sum  : {load_sum_b:,.0f} kWh  (atteso > 150,000)")
-    print(f"  pv sum    : {pv_sum_b:,.0f} kWh")
-    print(f"  grid draw : {grid_sum_b:,.1f} kWh  (atteso ~150,000)")
-    print(f"  source    : {meta_b['load_kw']['source']}")
-    print(f"  warnings  : {warns_b}")
-    assert load_sum_b > 150_000, f"load sum deve superare 150,000 kWh: {load_sum_b}"
-    assert abs(grid_sum_b - 150_000) < 2, f"grid draw non converge: {grid_sum_b}"
-    print("  OK\n")
-
-    shutil.rmtree(TMP)
-    print("Tutti i test passati.")

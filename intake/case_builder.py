@@ -179,22 +179,8 @@ def build_site_diagnostic(form: dict, base_dir: str = ".") -> dict:
         sdi["profiles"] = profiles_section
         warnings.extend(prof_warnings)
 
-        # Case B: update site.consumo_annuo_kwh with the reconstructed site value.
-        # The billing consumo (net grid draw) was used as seed; the real site
-        # consumption is higher because it includes PV self-consumption.
-        if macro_case == "B":
-            cached = load_profiles(sdi, base_dir)
-            if cached is not None:
-                consumo_ricost = round(float(cached["load_kw"].sum() * 0.25))
-                sdi["site"]["consumo_annuo_kwh"] = {
-                    "value":      consumo_ricost,
-                    "source":     "reconstructed_from_bill_and_pv",
-                    "confidence": "low",
-                    "note": (
-                        "Consumo sito ricostruito via temporal matching. "
-                        "Include autoconsumo FV — superiore al prelievo netto da bolletta."
-                    ),
-                }
+        # Case B: sdi["site"]["consumo_annuo_kwh"] è già aggiornato dentro generate_profiles()
+        # con il fabbisogno ricostruito da site_reconstruction.reconcile().
 
     except NotImplementedError as exc:
         warnings.append(f"Profili non generati: {exc}")
