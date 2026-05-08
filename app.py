@@ -1663,7 +1663,7 @@ def _build_effective_model(
 def _s2_fv_hourly_from_monthly(pv_monthly: list) -> list:
     """Profilo FV orario sintetico (8760 h) che rispetta i totali mensili PVGIS."""
     import math
-    _SIGMA = 3.0
+    _SIGMA = 2.0
     _DAYS  = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     _gauss_daily_sum = sum(
         math.exp(-0.5 * ((h + 0.5 - 12.5) / _SIGMA) ** 2) for h in range(24)

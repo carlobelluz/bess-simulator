@@ -263,8 +263,12 @@ def _extract_monthly_bands(
                 f3[m_idx] = float(entry.get("f3_kwh") or 0.0)
             except (TypeError, ValueError):
                 continue
-        if any(f1) or any(f2) or any(f3):
+        months_with_data = sum(1 for i in range(12) if f1[i] > 0 or f2[i] > 0 or f3[i] > 0)
+        if months_with_data >= 10:
             return f1, f2, f3
+        f1 = [0.0] * 12
+        f2 = [0.0] * 12
+        f3 = [0.0] * 12
 
     # Try 2: aggregati annuali → distribuzione uniforme
     f1_tot = float(billing.get("f1_kwh") or 0.0)

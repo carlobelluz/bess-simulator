@@ -249,9 +249,17 @@ def aggregate_bills(bills: list[dict], form: dict) -> dict:
     # Monthly breakdowns for intake charts — available for any n (not only n==12)
     sorted_bills = sorted(bills, key=lambda b: b.get("periodo") or "")
 
+    def _periodo_to_mese(p):
+        if isinstance(p, int):
+            return p
+        try:
+            return int(str(p)[5:7])
+        except (TypeError, ValueError, IndexError):
+            return None
+
     mensili_per_fascia = [
         {
-            "mese":        b.get("periodo"),
+            "mese":        _periodo_to_mese(b.get("periodo")),
             "consumo_kwh": b.get("consumo_kwh"),
             "f1_kwh":      b.get("f1_kwh"),
             "f2_kwh":      b.get("f2_kwh"),
