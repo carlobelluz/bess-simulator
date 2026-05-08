@@ -21,5 +21,8 @@ results/
 # Cache PVGIS — generata automaticamente, non necessaria su GitHub
 pvgis_cache/
 
+# Cache profili — generata automaticamente, non necessaria su GitHub
+profiles_cache/
+
 # Jupyter
 .ipynb_checkpoints/

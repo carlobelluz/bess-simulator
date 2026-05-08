@@ -52,7 +52,7 @@ def build_all_profiles(case: dict, base_dir: str = ".") -> dict:
       slot_hours    float          — 0.25
       n_slots       int            — 35040
     """
-    ti = _make_time_index()
+    ti = make_time_index()
     out = {
         "load_kw":       build_load_profile(case["site"], ti),
         "pv_kw":         build_pv_profile(case["pv"], ti, case.get("site"), base_dir),
@@ -74,7 +74,7 @@ def build_load_profile(site: dict, ti: dict | None = None) -> np.ndarray:
     SWAP_LOAD: replace _synthetic_load() body with a CSV reader.
     """
     if ti is None:
-        ti = _make_time_index()
+        ti = make_time_index()
     return _synthetic_load(site, ti)
 
 
@@ -91,7 +91,7 @@ def build_pv_profile(pv: dict, ti: dict | None = None,
     if not pv.get("presente", False):
         return np.zeros(N_SLOTS)
     if ti is None:
-        ti = _make_time_index()
+        ti = make_time_index()
     if pv.get("profilo_source") == "pvgis":
         return _pvgis_pv(pv, site or {}, base_dir)
     return _synthetic_pv(pv)
@@ -104,7 +104,7 @@ def build_price_profile(tariffs: dict, base_dir: str = ".", ti: dict | None = No
     SWAP_PRICE: the real-data path is already wired — populate the JSON.
     """
     if ti is None:
-        ti = _make_time_index()
+        ti = make_time_index()
     spread    = tariffs["supplier_spread_eur_kwh"]
     market_h  = _load_market_prices(tariffs.get("market_price_series", ""), base_dir)
     # Upsample hourly → 15-min. Price is constant within each hour.
@@ -114,7 +114,7 @@ def build_price_profile(tariffs: dict, base_dir: str = ".", ti: dict | None = No
 
 # ── Time index ────────────────────────────────────────────────────────────────
 
-def _make_time_index() -> dict:
+def make_time_index() -> dict:
     """
     Builds the four time-coordinate arrays for all 35,040 slots.
     Reference year: Jan 1, 2024 = slot 0 = Monday (dow=0).
@@ -416,26 +416,3 @@ def _synthetic_market_prices() -> np.ndarray:
     noise = np.clip(rng.normal(1.0, 0.06, N_HOURS), 0.75, 1.30)
     return prices * noise
 
-
-# ── Quick sanity check ────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import sys
-    case_path = sys.argv[1] if len(sys.argv) > 1 else "cases/example_case.json"
-    base_dir  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-    with open(os.path.join(base_dir, case_path)) as f:
-        case = json.load(f)
-
-    p = build_all_profiles(case, base_dir)
-
-    print(f"load_kw       — sum={p['load_kw'].sum() * SLOT_H:,.0f} kWh/yr  "
-          f"peak={p['load_kw'].max():.1f} kW  min={p['load_kw'].min():.1f} kW")
-    print(f"pv_kw         — sum={p['pv_kw'].sum() * SLOT_H:,.0f} kWh/yr  "
-          f"peak={p['pv_kw'].max():.1f} kW")
-    print(f"price_eur_kwh — mean={p['price_eur_kwh'].mean():.4f} €/kWh  "
-          f"min={p['price_eur_kwh'].min():.4f}  max={p['price_eur_kwh'].max():.4f}")
-    print(f"time index    — months {p['month'].min()}-{p['month'].max()}  "
-          f"hours {p['hour'].min()}-{p['hour'].max()}  "
-          f"dow {p['dow'].min()}-{p['dow'].max()}")
-    print("OK")

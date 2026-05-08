@@ -444,34 +444,3 @@ def _make_result(
         "charged_fv_ac_kwh":   z.copy() if charged_fv_ac_kwh   is None else np.asarray(charged_fv_ac_kwh,   dtype=float),
     }
 
-
-# ── Quick sanity check ────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from engine.profile_builder import build_all_profiles  # noqa: E402
-
-    case_path = sys.argv[1] if len(sys.argv) > 1 else "cases/example_case.json"
-    base_dir  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-    with open(os.path.join(base_dir, case_path)) as f:
-        case = json.load(f)
-
-    profiles = build_all_profiles(case, base_dir)
-    results  = simulate(case, profiles)
-
-    cap_nom = case["bess"]["capacita_nominale_kwh"]
-    print(f"{'Scenario':<6}  {'Grid import':>14}  {'Peak kW':>8}  "
-          f"{'Throughput':>12}  {'Cycles/yr':>10}  {'Grid export':>12}")
-    print("-" * 72)
-    for sc, r in results.items():
-        g         = r["grid_kw"]
-        import_kwh = g.clip(min=0).sum() * SLOT_H
-        export_kwh = (-g).clip(min=0).sum() * SLOT_H
-        peak_kw    = g.max()
-        throughput = r["bess_discharge_kw"].sum() * SLOT_H
-        cycles     = throughput / cap_nom if cap_nom > 0 else 0.0
-        print(f"{sc:<6}  {import_kwh:>14,.0f}  {peak_kw:>8.1f}  "
-              f"{throughput:>12,.0f}  {cycles:>10.0f}  {export_kwh:>12,.0f}")
-    print("OK")

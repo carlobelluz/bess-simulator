@@ -25,7 +25,6 @@ Convenzioni:
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Literal, Optional
@@ -33,7 +32,7 @@ from typing import Literal, Optional
 import numpy as np
 from scipy.optimize import minimize
 
-from intake.tariff_bands import build_band_masks, italian_holidays, validate_band_reconstruction
+from intake.tariff_bands import build_band_masks, italian_holidays
 
 
 # ── Tipi ──────────────────────────────────────────────────────────────────────
@@ -632,39 +631,3 @@ def reconcile(state: SiteEnergyState) -> SiteEnergyState:
 
     return state
 
-
-# ── Utility di stampa (per controllo visivo) ──────────────────────────────────
-
-def print_reconcile_summary(state: SiteEnergyState) -> None:
-    """Stampa un riepilogo dell'output di reconcile() a console."""
-    sep = "─" * 60
-    print(sep)
-    print(f"SITE RECONSTRUCTION SUMMARY — {state.anno_riferimento}")
-    print(sep)
-    print(f"Archetipo inferito : {state.archetype_inferred} "
-          f"(score={state.archetype_confidence_score:.2f})")
-    print(f"Reconcile mode     : {state.reconcile_mode}")
-    print(f"Confidenza globale : {state.overall_confidence}")
-    print(f"Calibration loss   : {state.calibration_loss:.6f}")
-    print(sep)
-    if state.fabbisogno_annuo_kwh:
-        print(f"Fabbisogno annuo   : {state.fabbisogno_annuo_kwh.value:>10,.0f} kWh")
-    if state.autoconsumo_fv_annuo_kwh:
-        print(f"Autoconsumo FV     : {state.autoconsumo_fv_annuo_kwh.value:>10,.0f} kWh")
-    if state.surplus_fv_annuo_kwh:
-        print(f"Surplus FV         : {state.surplus_fv_annuo_kwh.value:>10,.0f} kWh")
-
-    prelievo_rete = (sum(state.prelievo_f1_mensile)
-                     + sum(state.prelievo_f2_mensile)
-                     + sum(state.prelievo_f3_mensile))
-    print(f"Prelievo rete ann. : {prelievo_rete:>10,.0f} kWh  (input bolletta)")
-    print(sep)
-    print("Errori per fascia (media annua):")
-    if state.band_match_error_pct:
-        for b, v in state.band_match_error_pct.items():
-            print(f"  {b.upper()} : {v:+.1f}%")
-    print(sep)
-    print("Assunzioni attive:")
-    for a in state.assumptions_active:
-        print(f"  • {a}")
-    print(sep)

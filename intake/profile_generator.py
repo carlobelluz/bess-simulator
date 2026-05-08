@@ -305,7 +305,8 @@ def _load_or_build_fv_hourly(
     Ritorna profilo FV orario (8760 valori, kW).
     Usa build_pv_profile (engine.profile_builder) e aggrega da 35040 → 8760.
     """
-    from engine.profile_builder import build_pv_profile, _make_time_index
+    from engine.profile_builder import build_pv_profile
+    from engine import make_time_index
 
     pv_ex = sdi.get("pv_existing") or {}
     site  = sdi.get("site")        or {}
@@ -325,7 +326,7 @@ def _load_or_build_fv_hourly(
         "lon": _v(site.get("lon"), None),
     }
 
-    ti       = _make_time_index()
+    ti       = make_time_index()
     pv_qh_kw = build_pv_profile(pv_dict, ti, site_dict, base_dir)   # 35040 slot
 
     # Aggrega in orario: media dei 4 slot quartorari per ogni ora
@@ -389,21 +390,22 @@ def _v_nested(sdi: dict, *keys, default=None):
 
 def _build_price_profile(sdi: dict, base_dir: str) -> np.ndarray:
     """Costruisce il profilo prezzi usando engine.profile_builder."""
-    from engine.profile_builder import build_price_profile, _make_time_index
+    from engine.profile_builder import build_price_profile
+    from engine import make_time_index
 
     tariff_s = sdi.get("tariff_context") or {}
     tariffs = {
         "market_price_series":     _v(tariff_s.get("market_price_series"), ""),
         "supplier_spread_eur_kwh": _v(tariff_s.get("supplier_spread_eur_kwh"), 0.0),
     }
-    ti = _make_time_index()
+    ti = make_time_index()
     return build_price_profile(tariffs, base_dir, ti)
 
 
 def _build_time_index_arrays(year: int) -> dict:
     """Genera gli array di metadati temporali richiesti dal formato cache."""
-    from engine.profile_builder import _make_time_index
-    ti = _make_time_index()   # già 35040 slot, anno standard
+    from engine import make_time_index
+    ti = make_time_index()   # già 35040 slot, anno standard
     return {
         "month":       ti["month"],
         "hour":        ti["hour"],
