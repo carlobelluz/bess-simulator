@@ -3425,6 +3425,23 @@ def _page_block1_intake() -> None:
         v = sum(b.get(key) or 0 for b in bills_data)
         return v if v > 0 else None
 
+    mensili_effettivi = [
+        {
+            "mese":        r.get("mese_idx"),
+            "consumo_kwh": r.get("consumo_kwh"),
+            "f1_kwh":      r.get("f1_kwh"),
+            "f2_kwh":      r.get("f2_kwh"),
+            "f3_kwh":      r.get("f3_kwh"),
+            "picco_kw":    r.get("picco_kw") if r.get("picco_source") in ("observed", "edited") else None,
+        }
+        for r in (effective_model or [])
+        if r.get("consumo_kwh") is not None and r.get("mese_idx") is not None
+    ]
+
+    _pv_eta_f  = int(st.session_state.get("intake_pv_eta", 0) or 0) if ha_pv else 0
+    _pv_deg_f  = float(st.session_state.get("intake_pv_deg", _PV_DEG_DEFAULT)) if ha_pv else 0.0
+    _pv_factor = round(1.0 - min(_pv_eta_f * _pv_deg_f / 100, 0.40), 6)
+
     intake_form = {
         "nome_cliente":              nome_cliente.strip() or "Sito",
         "comune":                    comune.strip(),
@@ -3456,6 +3473,8 @@ def _page_block1_intake() -> None:
         "f2_kwh":                    _safe_sum("f2_kwh"),
         "f3_kwh":                    _safe_sum("f3_kwh"),
         "user_constraints":          st.session_state.get("intake_user_constraints"),
+        "mensili_effettivi":         mensili_effettivi if mensili_effettivi else None,
+        "pv_degradation_factor":     _pv_factor if ha_pv else 1.0,
     }
 
     # ── Block 1: SDI + Diagnostica ────────────────────────────────────────────

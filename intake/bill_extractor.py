@@ -269,10 +269,25 @@ def aggregate_bills(bills: list[dict], form: dict) -> dict:
     ]
 
     picchi_mensili_kw = [
-        {"mese": b.get("periodo"), "picco_kw": b.get("picco_kw")}
+        {"mese": _periodo_to_mese(b.get("periodo")), "picco_kw": b.get("picco_kw")}
         for b in sorted_bills
         if b.get("picco_kw") is not None
     ]
+
+    # Override da effective_model (correzioni utente sezione 1.3)
+    if form.get("mensili_effettivi"):
+        eff = form["mensili_effettivi"]
+        mensili_per_fascia = [
+            {k: v for k, v in e.items() if k != "picco_kw"}
+            for e in eff
+        ]
+        _picchi_eff = [
+            {"mese": e["mese"], "picco_kw": e["picco_kw"]}
+            for e in eff
+            if e.get("picco_kw") is not None and e.get("mese") is not None
+        ]
+        if _picchi_eff:
+            picchi_mensili_kw = _picchi_eff
 
     return {
         "n_bills":      n,

@@ -364,6 +364,9 @@ def _load_or_build_fv_hourly(
 
     # Aggrega in orario: media dei 4 slot quartorari per ogni ora
     pv_hourly = pv_qh_kw[:35040].reshape(8760, 4).mean(axis=1)
+    deg_factor = float(_v(pv_ex.get("degradation_factor"), 1.0))
+    if deg_factor != 1.0:
+        pv_hourly = pv_hourly * deg_factor
     return pv_hourly
 
 

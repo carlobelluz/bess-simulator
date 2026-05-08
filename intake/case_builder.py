@@ -307,6 +307,8 @@ def _build_pv_existing(form: dict, lat, lon) -> dict | None:
             "monthly_values": uc.get("monthly_values"),
         }
 
+    pv["degradation_factor"] = float(form.get("pv_degradation_factor") or 1.0)
+
     return pv
 
 
